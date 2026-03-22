@@ -53,6 +53,7 @@ const sidebars: SidebarsConfig = {
           },
           items: [
             'user-guide/lws-integration',
+            'user-guide/modelserving-plugin-framework',
           ],
         },
         'user-guide/multi-node-inference',
@@ -61,6 +62,15 @@ const sidebars: SidebarsConfig = {
           type: 'doc',
           label: 'Autoscaler',
           id: 'user-guide/autoscaler',
+        },
+        {
+          type: 'category',
+          label: 'workload',
+          items: [
+            'user-guide/binpack-scale-down',
+            'user-guide/gang-scheduling',
+            'user-guide/network-topology',
+          ],
         },
         {
           type: 'category',

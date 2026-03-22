@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -40,6 +41,8 @@ var (
 	testNamespace   string
 	kthenaNamespace string
 )
+
+const testDataDir = "test/e2e/router/testdata"
 
 // TestMain runs setup and cleanup for all tests in this package.
 func TestMain(m *testing.M) {
@@ -129,10 +132,22 @@ func TestModelRouteWithRateLimit(t *testing.T) {
 	router.TestModelRouteWithRateLimitShared(t, testCtx, testNamespace, true, kthenaNamespace)
 }
 
+// TestModelRouteWithGlobalRateLimit tests global rate limiting enforced by the Kthena Router.
+// This test runs the shared test function with Gateway API enabled (with ParentRefs).
+func TestModelRouteWithGlobalRateLimit(t *testing.T) {
+	router.TestModelRouteWithGlobalRateLimitShared(t, testCtx, testNamespace, true, kthenaNamespace)
+}
+
 // TestModelRouteLora tests ModelRoute with LoRA adapter routing.
 // This test runs the shared test function with Gateway API enabled (with ParentRefs).
 func TestModelRouteLora(t *testing.T) {
 	router.TestModelRouteLoraShared(t, testCtx, testNamespace, true, kthenaNamespace)
+}
+
+// TestModelRouteDuplicatePreferOldest tests that duplicate ModelRoutes for the same model
+// are evaluated oldest-first and the first match wins; after the oldest is deleted, the newer takes over.
+func TestModelRouteDuplicatePreferOldest(t *testing.T) {
+	router.TestModelRouteDuplicatePreferOldestShared(t, testCtx, testNamespace, true, kthenaNamespace)
 }
 
 // TestMetrics tests router metrics collection.
@@ -155,7 +170,7 @@ func TestDuplicateModelName(t *testing.T) {
 
 	// 1. Deploy ModelRouteSimple.yaml with parentRefs to default Gateway
 	t.Log("Deploying ModelRouteSimple binding to default Gateway...")
-	modelRoute1 := utils.LoadYAMLFromFile[networkingv1alpha1.ModelRoute]("examples/kthena-router/ModelRouteSimple.yaml")
+	modelRoute1 := utils.LoadYAMLFromFile[networkingv1alpha1.ModelRoute](filepath.Join(testDataDir, "ModelRouteSimple.yaml"))
 	modelRoute1.Namespace = testNamespace
 	modelRoute1.Name = "deepseek-simple-default"
 
@@ -184,7 +199,7 @@ func TestDuplicateModelName(t *testing.T) {
 
 	// 2. Create custom Gateway with port 8081
 	t.Log("Creating custom Gateway with port 8081...")
-	customGateway := utils.LoadYAMLFromFile[gatewayv1.Gateway]("examples/kthena-router/Gateway.yaml")
+	customGateway := utils.LoadYAMLFromFile[gatewayv1.Gateway](filepath.Join(testDataDir, "Gateway.yaml"))
 	customGateway.Namespace = kthenaNamespace
 	customGateway.Name = "kthena-gateway-custom"
 	customGateway.Spec.Listeners[0].Port = gatewayv1.PortNumber(8081)

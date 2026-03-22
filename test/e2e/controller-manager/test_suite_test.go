@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -111,12 +112,41 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func setupControllerManagerE2ETest(t *testing.T) (context.Context, *clientset.Clientset) {
+func setupControllerManagerE2ETest(t *testing.T) (context.Context, *clientset.Clientset, *kubernetes.Clientset) {
 	t.Helper()
 	ctx := context.Background()
 	config, err := utils.GetKubeConfig()
 	require.NoError(t, err, "Failed to get kubeconfig")
 	kthenaClient, err := clientset.NewForConfig(config)
 	require.NoError(t, err, "Failed to create kthena client")
-	return ctx, kthenaClient
+	kubeClient, err := kubernetes.NewForConfig(config)
+	require.NoError(t, err, "Failed to create Kubernetes client")
+	return ctx, kthenaClient, kubeClient
+}
+
+func waitForWebhookReady(t *testing.T, ctx context.Context, kthenaClient *clientset.Clientset, namespace string) {
+	t.Helper()
+	t.Log("Waiting for webhook server to accept requests")
+
+	waitCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
+	err := wait.PollUntilContextCancel(waitCtx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
+		probe := createValidModelBoosterForWebhookTest()
+		probe.Namespace = namespace
+		probe.Name = "webhook-ready-probe-" + utils.RandomString(5)
+
+		_, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(namespace).Create(ctx, probe, metav1.CreateOptions{DryRun: []string{"All"}})
+		if err != nil {
+			errStr := err.Error()
+			if strings.Contains(errStr, "connect: connection refused") {
+				t.Logf("Webhook not ready yet (connection refused), retrying: %v", err)
+				return false, nil
+			}
+			return false, err
+		}
+
+		return true, nil
+	})
+	require.NoError(t, err, "Webhook did not become ready in time")
 }

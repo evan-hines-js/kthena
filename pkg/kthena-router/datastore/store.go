@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -383,14 +384,21 @@ func (s *store) AddOrUpdateModelServer(ms *aiv1alpha1.ModelServer, pods sets.Set
 	var modelServerObj *modelServer
 	if value, ok := s.modelServer.Load(name); !ok {
 		modelServerObj = newModelServer(ms)
+		// New object — no concurrent access yet, safe to write without lock
+		if len(pods) != 0 {
+			modelServerObj.pods = pods
+		}
 	} else {
 		modelServerObj = value.(*modelServer)
+		// Existing object — concurrent readers may access modelServer and pods,
+		// so we must hold the lock to prevent data races.
+		modelServerObj.mutex.Lock()
 		modelServerObj.modelServer = ms
-	}
-
-	if len(pods) != 0 {
-		// do not operate s.pods here, which are done within pod handler
-		modelServerObj.pods = pods
+		if len(pods) != 0 {
+			// do not operate s.pods here, which are done within pod handler
+			modelServerObj.pods = pods
+		}
+		modelServerObj.mutex.Unlock()
 	}
 	s.modelServer.Store(name, modelServerObj)
 	return nil
@@ -421,7 +429,7 @@ func (s *store) DeleteModelServer(ms types.NamespacedName) error {
 
 func (s *store) GetModelServer(name types.NamespacedName) *aiv1alpha1.ModelServer {
 	if value, ok := s.modelServer.Load(name); ok {
-		return value.(*modelServer).modelServer
+		return value.(*modelServer).getModelServer()
 	}
 	return nil
 }
@@ -512,17 +520,14 @@ func (s *store) GetPrefillPodsForDecodeGroup(modelServerName types.NamespacedNam
 
 func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.ModelServer) error {
 	podName := utils.GetNamespaceName(pod)
-	newPodInfo := &PodInfo{
-		Pod:         pod,
-		modelServer: sets.Set[types.NamespacedName]{},
-		models:      sets.New[string](),
-	}
 
+	newModelServers := sets.New[types.NamespacedName]()
+	var engine string
 	for _, ms := range modelServers {
 		modelServerName := utils.GetNamespaceName(ms)
-		newPodInfo.AddModelServer(modelServerName)
+		newModelServers.Insert(modelServerName)
 		// NOTE: even if a pod belongs to multiple model servers, the backend should be the same
-		newPodInfo.engine = string(ms.Spec.InferenceEngine)
+		engine = string(ms.Spec.InferenceEngine)
 		if value, ok := s.modelServer.Load(modelServerName); ok {
 			ms := value.(*modelServer)
 			ms.addPod(podName)
@@ -532,12 +537,12 @@ func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.Model
 		}
 	}
 
-	var oldPodInfo *PodInfo
 	if value, ok := s.pods.Load(podName); ok {
-		oldPodInfo = value.(*PodInfo)
+		// Update existing pod in place — preserve runtime metrics and models.
+		oldPodInfo := value.(*PodInfo)
 		oldModelServers := oldPodInfo.GetModelServers()
-		// Handle the case where the pod is no longer belong to some model servers
-		for msName := range oldModelServers.Difference(newPodInfo.modelServer) {
+		// Handle the case where the pod no longer belongs to some model servers
+		for msName := range oldModelServers.Difference(newModelServers) {
 			if value, ok := s.modelServer.Load(msName); ok {
 				ms := value.(*modelServer)
 				ms.deletePod(podName)
@@ -545,14 +550,25 @@ func (s *store) AddOrUpdatePod(pod *corev1.Pod, modelServers []*aiv1alpha1.Model
 				ms.removePodFromPDGroups(podName, oldPodInfo.Pod.Labels)
 			}
 		}
+
+		oldPodInfo.mutex.Lock()
+		oldPodInfo.Pod = pod
+		oldPodInfo.engine = engine
+		oldPodInfo.modelServer = newModelServers
+		oldPodInfo.mutex.Unlock()
+		return nil
 	}
 
+	// New pod — create PodInfo and fetch initial metrics.
+	newPodInfo := &PodInfo{
+		Pod:         pod,
+		engine:      engine,
+		modelServer: newModelServers,
+		models:      sets.New[string](),
+	}
 	s.pods.Store(podName, newPodInfo)
-
-	if oldPodInfo == nil {
-		s.updatePodMetrics(newPodInfo)
-		s.updatePodModels(newPodInfo)
-	}
+	s.updatePodMetrics(newPodInfo)
+	s.updatePodModels(newPodInfo)
 
 	return nil
 }
@@ -634,14 +650,17 @@ func (s *store) AddOrUpdateModelRoute(mr *aiv1alpha1.ModelRoute) error {
 		found := false
 		for i, route := range routes {
 			if route.Namespace == mr.Namespace && route.Name == mr.Name {
-				routes[i] = mr                       // Update existing
+				routes[i] = mr // Update existing
+				sortModelRoutesInPlace(routes)
 				s.routes[mr.Spec.ModelName] = routes // Update the map
 				found = true
 				break
 			}
 		}
 		if !found {
-			s.routes[mr.Spec.ModelName] = append(routes, mr)
+			routes = append(routes, mr)
+			sortModelRoutesInPlace(routes)
+			s.routes[mr.Spec.ModelName] = routes
 		}
 	}
 
@@ -651,14 +670,17 @@ func (s *store) AddOrUpdateModelRoute(mr *aiv1alpha1.ModelRoute) error {
 		found := false
 		for i, route := range loraRoutes {
 			if route.Namespace == mr.Namespace && route.Name == mr.Name {
-				loraRoutes[i] = mr              // Update existing
+				loraRoutes[i] = mr // Update existing
+				sortModelRoutesInPlace(loraRoutes)
 				s.loraRoutes[lora] = loraRoutes // Update the map
 				found = true
 				break
 			}
 		}
 		if !found {
-			s.loraRoutes[lora] = append(loraRoutes, mr)
+			loraRoutes = append(loraRoutes, mr)
+			sortModelRoutesInPlace(loraRoutes)
+			s.loraRoutes[lora] = loraRoutes
 		}
 	}
 
@@ -689,11 +711,27 @@ func (s *store) AddOrUpdateModelRoute(mr *aiv1alpha1.ModelRoute) error {
 	return nil
 }
 
+func sortModelRoutesInPlace(routes []*aiv1alpha1.ModelRoute) {
+	sort.Slice(routes, func(i, j int) bool {
+		ti, tj := routes[i].CreationTimestamp.Time, routes[j].CreationTimestamp.Time
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		ri, rj := routes[i].ResourceVersion, routes[j].ResourceVersion
+		if ri != rj {
+			return ri < rj
+		}
+		return routes[i].Namespace+"/"+routes[i].Name < routes[j].Namespace+"/"+routes[j].Name
+	})
+}
+
 func (s *store) DeleteModelRoute(namespacedName string) error {
 	s.routeMutex.Lock()
 	info := s.routeInfo[namespacedName]
 	var modelName string
 	var deletedRoute *aiv1alpha1.ModelRoute
+	// Collect all model/lora names that may have associated queues (for cleanup after unlock)
+	var namesToCleanQueue []string
 	if info != nil {
 		modelName = info.model
 		// Remove from routes map
@@ -710,6 +748,7 @@ func (s *store) DeleteModelRoute(namespacedName string) error {
 			}
 			if len(newRoutes) == 0 {
 				delete(s.routes, modelName)
+				namesToCleanQueue = append(namesToCleanQueue, modelName)
 			} else {
 				s.routes[modelName] = newRoutes
 			}
@@ -728,6 +767,7 @@ func (s *store) DeleteModelRoute(namespacedName string) error {
 			}
 			if len(newLoraRoutes) == 0 {
 				delete(s.loraRoutes, lora)
+				namesToCleanQueue = append(namesToCleanQueue, lora)
 			} else {
 				s.loraRoutes[lora] = newLoraRoutes
 			}
@@ -757,13 +797,14 @@ func (s *store) DeleteModelRoute(namespacedName string) error {
 
 	delete(s.routeInfo, namespacedName)
 	s.routeMutex.Unlock()
-	if modelName != "" {
-		// Clean up associated waiting queue if exists
-		val, _ := s.requestWaitingQueue.LoadAndDelete(modelName)
+
+	// Clean up associated waiting queues for both base model and all lora adapters
+	for _, name := range namesToCleanQueue {
+		val, _ := s.requestWaitingQueue.LoadAndDelete(name)
 		if val != nil {
 			queue, _ := val.(*RequestPriorityQueue)
 			queue.Close()
-			klog.Infof("deleted waiting queue for model %s", modelName)
+			klog.Infof("deleted waiting queue for model %s", name)
 		}
 	}
 
@@ -798,7 +839,7 @@ func (s *store) MatchModelServer(model string, req *http.Request, gatewayKey str
 		isLora = true
 	}
 
-	// Try each ModelRoute until we find one that matches
+	// candidateRoutes are kept sorted oldest-first by AddOrUpdateModelRoute
 	for _, mr := range candidateRoutes {
 		// Check parentRefs if specified
 		if len(mr.Spec.ParentRefs) > 0 {
@@ -974,14 +1015,12 @@ func toWeightedSlice(targets []*aiv1alpha1.TargetModel) ([]uint32, error) {
 }
 
 func selectFromWeightedSlice(weights []uint32) int {
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-
 	totalWeight := 0
 	for _, weight := range weights {
 		totalWeight += int(weight)
 	}
 
-	randomNum := rng.Intn(totalWeight)
+	randomNum := rand.Intn(totalWeight)
 
 	for i, weight := range weights {
 		randomNum -= int(weight)
@@ -1312,7 +1351,7 @@ func (s *store) GetAllModelServers() map[types.NamespacedName]*aiv1alpha1.ModelS
 	s.modelServer.Range(func(key, value any) bool {
 		if namespacedName, ok := key.(types.NamespacedName); ok {
 			if ms, ok := value.(*modelServer); ok {
-				result[namespacedName] = ms.modelServer
+				result[namespacedName] = ms.getModelServer()
 			}
 		}
 		return true

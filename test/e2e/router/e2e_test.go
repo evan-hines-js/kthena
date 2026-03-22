@@ -128,10 +128,22 @@ func TestModelRouteWithRateLimit(t *testing.T) {
 	TestModelRouteWithRateLimitShared(t, testCtx, testNamespace, false, "")
 }
 
+// TestModelRouteWithGlobalRateLimit tests global rate limiting enforced by the Kthena Router.
+// This test runs the shared test function without Gateway API (no ParentRefs).
+func TestModelRouteWithGlobalRateLimit(t *testing.T) {
+	TestModelRouteWithGlobalRateLimitShared(t, testCtx, testNamespace, false, kthenaNamespace)
+}
+
 // TestModelRouteLora tests ModelRoute with LoRA adapter routing.
 // This test runs the shared test function without Gateway API (no ParentRefs).
 func TestModelRouteLora(t *testing.T) {
 	TestModelRouteLoraShared(t, testCtx, testNamespace, false, "")
+}
+
+// TestModelRouteDuplicatePreferOldest tests that duplicate ModelRoutes for the same model
+// are evaluated oldest-first and the first match wins; after the oldest is deleted, the newer takes over.
+func TestModelRouteDuplicatePreferOldest(t *testing.T) {
+	TestModelRouteDuplicatePreferOldestShared(t, testCtx, testNamespace, false, "")
 }
 
 // TestMetrics tests router metrics collection.

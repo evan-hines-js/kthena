@@ -687,6 +687,50 @@ func TestStoreDeleteModelRoute_RequestQueueCleanup(t *testing.T) {
 	assert.False(t, exists)
 }
 
+// TestStoreDeleteModelRoute_LoraQueueCleanup verifies that when a ModelRoute with lora adapters is deleted,
+// waiting queues for both the base model and all lora names are cleaned up (ratelimit/fairness per-model resources).
+func TestStoreDeleteModelRoute_LoraQueueCleanup(t *testing.T) {
+	s := &store{
+		routeInfo:           make(map[string]*modelRouteInfo),
+		routes:              make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:          make(map[string][]*aiv1alpha1.ModelRoute),
+		callbacks:           make(map[string][]CallbackFunc),
+		requestWaitingQueue: sync.Map{},
+	}
+
+	// Create a model route with base model and lora adapters
+	mr := &aiv1alpha1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "lora-cleanup-test",
+		},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName:    "base-model",
+			LoraAdapters: []string{"lora-a", "lora-b"},
+		},
+	}
+
+	err := s.AddOrUpdateModelRoute(mr)
+	assert.NoError(t, err)
+
+	// Create waiting queues for base model and loras (as used by fairness/ratelimit per-model)
+	s.requestWaitingQueue.Store("base-model", NewRequestPriorityQueue(nil))
+	s.requestWaitingQueue.Store("lora-a", NewRequestPriorityQueue(nil))
+	s.requestWaitingQueue.Store("lora-b", NewRequestPriorityQueue(nil))
+
+	// Delete the model route
+	err = s.DeleteModelRoute("default/lora-cleanup-test")
+	assert.NoError(t, err)
+
+	// Verify all related queues are deleted (base model + lora adapters)
+	_, existsBase := s.requestWaitingQueue.Load("base-model")
+	_, existsLoraA := s.requestWaitingQueue.Load("lora-a")
+	_, existsLoraB := s.requestWaitingQueue.Load("lora-b")
+	assert.False(t, existsBase, "waiting queue for base model should be cleaned up")
+	assert.False(t, existsLoraA, "waiting queue for lora-a should be cleaned up")
+	assert.False(t, existsLoraB, "waiting queue for lora-b should be cleaned up")
+}
+
 // TestStoreDeleteModelRoute_ConcurrentAccess tests thread safety of DeleteModelRoute
 func TestStoreDeleteModelRoute_ConcurrentAccess(t *testing.T) {
 	s := &store{
@@ -1185,6 +1229,185 @@ func TestStoreMatchModelServer(t *testing.T) {
 			expectedError:  false,
 		},
 		{
+			name: "duplicate model route - prefer prebuilt (oldest) ModelRoute",
+			setupStore: func() *store {
+				s := &store{
+					routeInfo:  make(map[string]*modelRouteInfo),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
+				}
+				// Prebuilt route (older CreationTimestamp)
+				prebuilt := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "prebuilt-route",
+						CreationTimestamp: metav1.NewTime(time.Now().Add(-1 * time.Hour)),
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{
+										ModelServerName: "prebuilt-server",
+										Weight:          ptr(uint32(100)),
+									},
+								},
+							},
+						},
+					},
+				}
+				// Newer duplicate route (newer CreationTimestamp) - should be ignored in favor of prebuilt
+				newer := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "newer-route",
+						CreationTimestamp: metav1.NewTime(time.Now()),
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{
+										ModelServerName: "newer-server",
+										Weight:          ptr(uint32(100)),
+									},
+								},
+							},
+						},
+					},
+				}
+				// Add newer first then prebuilt to verify sort order (CreationTimestamp) wins over add order
+				s.AddOrUpdateModelRoute(newer)
+				s.AddOrUpdateModelRoute(prebuilt)
+				return s
+			},
+			modelName:      "llama2-7b",
+			request:        &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedServer: types.NamespacedName{Namespace: "default", Name: "prebuilt-server"},
+			expectedIsLora: false,
+			expectedError:  false,
+		},
+		{
+			name: "duplicate model route - same CreationTimestamp, resourceVersion tie-break prefers older",
+			setupStore: func() *store {
+				s := &store{
+					routeInfo:  make(map[string]*modelRouteInfo),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
+				}
+				baseTime := time.Now()
+				// Older route (smaller resourceVersion = earlier in etcd)
+				older := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "z-older-route",
+						CreationTimestamp: metav1.NewTime(baseTime),
+						ResourceVersion:   "10",
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{ModelServerName: "older-server", Weight: ptr(uint32(100))},
+								},
+							},
+						},
+					},
+				}
+				// Newer route (larger resourceVersion, created in same second)
+				newer := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "a-newer-route",
+						CreationTimestamp: metav1.NewTime(baseTime),
+						ResourceVersion:   "11",
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{ModelServerName: "newer-server", Weight: ptr(uint32(100))},
+								},
+							},
+						},
+					},
+				}
+				// Add newer first - lexicographic name would wrongly prefer a-newer-route; resourceVersion ensures z-older-route wins
+				s.AddOrUpdateModelRoute(newer)
+				s.AddOrUpdateModelRoute(older)
+				return s
+			},
+			modelName:      "llama2-7b",
+			request:        &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedServer: types.NamespacedName{Namespace: "default", Name: "older-server"},
+			expectedIsLora: false,
+			expectedError:  false,
+		},
+		{
+			name: "duplicate model route - newer takes over after prebuilt deleted",
+			setupStore: func() *store {
+				s := &store{
+					routeInfo:  make(map[string]*modelRouteInfo),
+					routes:     make(map[string][]*aiv1alpha1.ModelRoute),
+					loraRoutes: make(map[string][]*aiv1alpha1.ModelRoute),
+				}
+				prebuilt := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "prebuilt-route",
+						CreationTimestamp: metav1.NewTime(time.Now().Add(-1 * time.Hour)),
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{ModelServerName: "prebuilt-server", Weight: ptr(uint32(100))},
+								},
+							},
+						},
+					},
+				}
+				newer := &aiv1alpha1.ModelRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:         "default",
+						Name:              "newer-route",
+						CreationTimestamp: metav1.NewTime(time.Now()),
+					},
+					Spec: aiv1alpha1.ModelRouteSpec{
+						ModelName: "llama2-7b",
+						Rules: []*aiv1alpha1.Rule{
+							{
+								Name: "default-rule",
+								TargetModels: []*aiv1alpha1.TargetModel{
+									{ModelServerName: "newer-server", Weight: ptr(uint32(100))},
+								},
+							},
+						},
+					},
+				}
+				s.AddOrUpdateModelRoute(prebuilt)
+				s.AddOrUpdateModelRoute(newer)
+				// Delete prebuilt - newer should take over
+				s.DeleteModelRoute("default/prebuilt-route")
+				return s
+			},
+			modelName:      "llama2-7b",
+			request:        &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}},
+			expectedServer: types.NamespacedName{Namespace: "default", Name: "newer-server"},
+			expectedIsLora: false,
+			expectedError:  false,
+		},
+		{
 			name: "no matching route",
 			setupStore: func() *store {
 				return &store{
@@ -1216,4 +1439,282 @@ func TestStoreMatchModelServer(t *testing.T) {
 			assert.Equal(t, tt.expectedServer, server)
 		})
 	}
+}
+
+func newStore() *store {
+	return New().(*store)
+}
+
+func TestAddOrUpdatePod_MetricsPreservedOnUpdate(t *testing.T) {
+	sampleCount := uint64(100)
+	sampleSum := 0.42
+	stubHistogram := &dto.Histogram{
+		SampleCount: &sampleCount,
+		SampleSum:   &sampleSum,
+	}
+
+	tests := []struct {
+		name            string
+		initialMetrics  map[string]float64
+		initialHist     map[string]*dto.Histogram
+		initialModels   []string
+		updatedLabels   map[string]string
+		wantGPUCache    float64
+		wantWaiting     float64
+		wantRunning     float64
+		wantTPOT        float64
+		wantTTFT        float64
+		wantModels      []string
+		wantHistPresent bool
+	}{
+		{
+			name: "pod label update preserves all gauge metrics",
+			initialMetrics: map[string]float64{
+				utils.GPUCacheUsage:     0.75,
+				utils.RequestWaitingNum: 8,
+				utils.RequestRunningNum: 12,
+				utils.TPOT:              0.03,
+				utils.TTFT:              0.15,
+			},
+			initialHist:     map[string]*dto.Histogram{},
+			initialModels:   []string{"llama-3"},
+			updatedLabels:   map[string]string{"version": "v2"},
+			wantGPUCache:    0.75,
+			wantWaiting:     8,
+			wantRunning:     12,
+			wantTPOT:        0.03,
+			wantTTFT:        0.15,
+			wantModels:      []string{"llama-3"},
+			wantHistPresent: false,
+		},
+		{
+			name: "pod update preserves histogram metrics",
+			initialMetrics: map[string]float64{
+				utils.GPUCacheUsage:     0.5,
+				utils.RequestWaitingNum: 3,
+				utils.RequestRunningNum: 7,
+				utils.TPOT:              0.02,
+				utils.TTFT:              0.1,
+			},
+			initialHist: map[string]*dto.Histogram{
+				utils.TPOT: stubHistogram,
+				utils.TTFT: stubHistogram,
+			},
+			initialModels:   []string{"mistral-7b", "lora-adapter-1"},
+			updatedLabels:   map[string]string{},
+			wantGPUCache:    0.5,
+			wantWaiting:     3,
+			wantRunning:     7,
+			wantTPOT:        0.02,
+			wantTTFT:        0.1,
+			wantModels:      []string{"mistral-7b", "lora-adapter-1"},
+			wantHistPresent: true,
+		},
+		{
+			name: "pod update with zero initial metrics preserves zeros",
+			initialMetrics: map[string]float64{
+				utils.GPUCacheUsage:     0,
+				utils.RequestWaitingNum: 0,
+				utils.RequestRunningNum: 0,
+			},
+			initialHist:     map[string]*dto.Histogram{},
+			initialModels:   []string{},
+			updatedLabels:   map[string]string{"canary": "true"},
+			wantGPUCache:    0,
+			wantWaiting:     0,
+			wantRunning:     0,
+			wantTPOT:        0,
+			wantTTFT:        0,
+			wantModels:      []string{},
+			wantHistPresent: false,
+		},
+		{
+			name: "pod update with high load preserves high metrics",
+			initialMetrics: map[string]float64{
+				utils.GPUCacheUsage:     0.99,
+				utils.RequestWaitingNum: 50,
+				utils.RequestRunningNum: 100,
+				utils.TPOT:              0.08,
+				utils.TTFT:              0.5,
+			},
+			initialHist:     map[string]*dto.Histogram{},
+			initialModels:   []string{"gpt-j"},
+			updatedLabels:   map[string]string{"zone": "us-east-1"},
+			wantGPUCache:    0.99,
+			wantWaiting:     50,
+			wantRunning:     100,
+			wantTPOT:        0.08,
+			wantTTFT:        0.5,
+			wantModels:      []string{"gpt-j"},
+			wantHistPresent: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStore()
+
+			ms := createTestModelServer("default", "ms1", aiv1alpha1.VLLM)
+			s.AddOrUpdateModelServer(ms, sets.New[types.NamespacedName]())
+
+			// Patch backend calls for the initial add
+			patch := gomonkey.NewPatches()
+			patch.ApplyFunc(backend.GetPodMetrics, func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+				return tc.initialMetrics, tc.initialHist
+			})
+			patch.ApplyFunc(backend.GetPodModels, func(_ string, _ *corev1.Pod) ([]string, error) {
+				return tc.initialModels, nil
+			})
+
+			pod := createTestPod("default", "pod1")
+			err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms})
+			assert.NoError(t, err)
+
+			patch.Reset()
+
+			// Backend should NOT be called during an update. If it is, fail loudly.
+			patch2 := gomonkey.NewPatches()
+			patch2.ApplyFunc(backend.GetPodMetrics, func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+				t.Fatal("backend.GetPodMetrics must not be called on pod update")
+				return nil, nil
+			})
+			patch2.ApplyFunc(backend.GetPodModels, func(_ string, _ *corev1.Pod) ([]string, error) {
+				t.Fatal("backend.GetPodModels must not be called on pod update")
+				return nil, nil
+			})
+			defer patch2.Reset()
+
+			// Simulate a pod update (e.g. label change)
+			updatedPod := pod.DeepCopy()
+			if tc.updatedLabels != nil {
+				updatedPod.Labels = tc.updatedLabels
+			}
+
+			err = s.AddOrUpdatePod(updatedPod, []*aiv1alpha1.ModelServer{ms})
+			assert.NoError(t, err)
+
+			podInfo := s.GetPodInfo(utils.GetNamespaceName(updatedPod))
+			assert.NotNil(t, podInfo)
+
+			assert.InDelta(t, tc.wantGPUCache, podInfo.GetGPUCacheUsage(), 1e-9,
+				"GPUCacheUsage dropped after pod update")
+			assert.InDelta(t, tc.wantWaiting, podInfo.GetRequestWaitingNum(), 1e-9,
+				"RequestWaitingNum dropped after pod update")
+			assert.InDelta(t, tc.wantRunning, podInfo.GetRequestRunningNum(), 1e-9,
+				"RequestRunningNum dropped after pod update")
+			assert.InDelta(t, tc.wantTPOT, podInfo.GetTPOT(), 1e-9,
+				"TPOT dropped after pod update")
+			assert.InDelta(t, tc.wantTTFT, podInfo.GetTTFT(), 1e-9,
+				"TTFT dropped after pod update")
+
+			models := podInfo.GetModels()
+			for _, m := range tc.wantModels {
+				assert.True(t, models.Contains(m), "model %s lost after pod update", m)
+			}
+			assert.Equal(t, len(tc.wantModels), models.Len(),
+				"model count changed after pod update")
+
+			if tc.wantHistPresent {
+				podInfo.mutex.RLock()
+				assert.NotNil(t, podInfo.TimePerOutputToken, "TPOT histogram lost after pod update")
+				assert.NotNil(t, podInfo.TimeToFirstToken, "TTFT histogram lost after pod update")
+				podInfo.mutex.RUnlock()
+			}
+		})
+	}
+}
+
+func TestAddOrUpdatePod_NewPodStillFetchesMetrics(t *testing.T) {
+	s := newStore()
+
+	ms := createTestModelServer("default", "ms1", aiv1alpha1.VLLM)
+	s.AddOrUpdateModelServer(ms, sets.New[types.NamespacedName]())
+
+	metricsCalled := false
+	modelsCalled := false
+
+	patch := gomonkey.NewPatches()
+	patch.ApplyFunc(backend.GetPodMetrics, func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+		metricsCalled = true
+		return map[string]float64{
+			utils.GPUCacheUsage:     0.3,
+			utils.RequestRunningNum: 2,
+		}, map[string]*dto.Histogram{}
+	})
+	patch.ApplyFunc(backend.GetPodModels, func(_ string, _ *corev1.Pod) ([]string, error) {
+		modelsCalled = true
+		return []string{"base-model"}, nil
+	})
+	defer patch.Reset()
+
+	pod := createTestPod("default", "fresh-pod")
+	err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms})
+	assert.NoError(t, err)
+
+	assert.True(t, metricsCalled, "backend.GetPodMetrics must be called for new pods")
+	assert.True(t, modelsCalled, "backend.GetPodModels must be called for new pods")
+
+	podInfo := s.GetPodInfo(utils.GetNamespaceName(pod))
+	assert.InDelta(t, 0.3, podInfo.GetGPUCacheUsage(), 1e-9)
+	assert.InDelta(t, 2.0, podInfo.GetRequestRunningNum(), 1e-9)
+}
+
+func TestAddOrUpdatePod_ModelServerChangePreservesMetrics(t *testing.T) {
+	s := newStore()
+
+	ms1 := createTestModelServer("default", "ms1", aiv1alpha1.VLLM)
+	ms2 := createTestModelServer("default", "ms2", aiv1alpha1.VLLM)
+	s.AddOrUpdateModelServer(ms1, sets.New[types.NamespacedName]())
+	s.AddOrUpdateModelServer(ms2, sets.New[types.NamespacedName]())
+
+	patch := gomonkey.NewPatches()
+	patch.ApplyFunc(backend.GetPodMetrics, func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+		return map[string]float64{
+			utils.GPUCacheUsage:     0.6,
+			utils.RequestWaitingNum: 5,
+			utils.RequestRunningNum: 10,
+			utils.TPOT:              0.04,
+			utils.TTFT:              0.2,
+		}, map[string]*dto.Histogram{}
+	})
+	patch.ApplyFunc(backend.GetPodModels, func(_ string, _ *corev1.Pod) ([]string, error) {
+		return []string{"model-a"}, nil
+	})
+
+	pod := createTestPod("default", "pod1")
+	err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms1})
+	assert.NoError(t, err)
+
+	patch.Reset()
+
+	// Block backend calls during the reassignment update
+	patch2 := gomonkey.NewPatches()
+	patch2.ApplyFunc(backend.GetPodMetrics, func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+		t.Fatal("backend.GetPodMetrics must not be called on pod update")
+		return nil, nil
+	})
+	patch2.ApplyFunc(backend.GetPodModels, func(_ string, _ *corev1.Pod) ([]string, error) {
+		t.Fatal("backend.GetPodModels must not be called on pod update")
+		return nil, nil
+	})
+	defer patch2.Reset()
+
+	// Move pod from ms1 to ms2
+	err = s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms2})
+	assert.NoError(t, err)
+
+	podInfo := s.GetPodInfo(utils.GetNamespaceName(pod))
+	assert.InDelta(t, 0.6, podInfo.GetGPUCacheUsage(), 1e-9,
+		"GPUCacheUsage lost during model server reassignment")
+	assert.InDelta(t, 5.0, podInfo.GetRequestWaitingNum(), 1e-9,
+		"RequestWaitingNum lost during model server reassignment")
+	assert.InDelta(t, 10.0, podInfo.GetRequestRunningNum(), 1e-9,
+		"RequestRunningNum lost during model server reassignment")
+	assert.InDelta(t, 0.04, podInfo.GetTPOT(), 1e-9,
+		"TPOT lost during model server reassignment")
+	assert.InDelta(t, 0.2, podInfo.GetTTFT(), 1e-9,
+		"TTFT lost during model server reassignment")
+
+	models := podInfo.GetModels()
+	assert.True(t, models.Contains("model-a"), "model lost during model server reassignment")
 }
