@@ -14,7 +14,11 @@ spec:
     singular: modelroute
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: ModelRoute is the Schema for the Modelroutes API.
@@ -51,7 +55,7 @@ spec:
                 description: |-
                   `model` in the LLM request, it could be a base model name, lora adapter name or even
                   a virtual model name. This field is used to match scenarios other than model adapter name and
-                  this field could be empty, but it and  `ModelAdapters` can't both be empty.
+                  this field could be empty, but it and `ModelAdapters` can't both be empty.
                 type: string
                 x-kubernetes-validations:
                 - message: modelName is immutable
@@ -321,11 +325,17 @@ spec:
                       type: string
                     targetModels:
                       items:
-                        description: LLM inference traffic target model
+                        description: LLM inference traffic target model.
                         properties:
+                          externalModelProviderName:
+                            description: |-
+                              ExternalModelProviderName is used to specify the correlated ExternalModelProvider within the same namespace.
+                              It is mutually exclusive with ModelServerName.
+                            type: string
                           modelServerName:
-                            description: ModelServerName is used to specify the correlated
-                              modelServer within the same namespace.
+                            description: |-
+                              ModelServerName is used to specify the correlated modelServer within the same namespace.
+                              It is mutually exclusive with ExternalModelProviderName.
                             type: string
                           weight:
                             default: 100
@@ -336,10 +346,15 @@ spec:
                             maximum: 100
                             minimum: 0
                             type: integer
-                        required:
-                        - modelServerName
                         type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of modelServerName or externalModelProviderName
+                            must be set
+                          rule: (has(self.modelServerName) && self.modelServerName
+                            != "") != (has(self.externalModelProviderName) && self.externalModelProviderName
+                            != "")
                       maxItems: 16
+                      minItems: 1
                       type: array
                   required:
                   - targetModels

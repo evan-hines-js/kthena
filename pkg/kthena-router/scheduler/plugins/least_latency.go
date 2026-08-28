@@ -17,11 +17,12 @@ limitations under the License.
 package plugins
 
 import (
+	"fmt"
 	"math"
 
-	"github.com/stretchr/testify/assert/yaml"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/yaml"
 
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/framework"
@@ -29,7 +30,12 @@ import (
 
 var _ framework.ScorePlugin = &LeastLatency{}
 
-const LeastLatencyPluginName = "least-latency"
+const (
+	LeastLatencyPluginName      = "least-latency"
+	defaultTTFTTPOTWeightFactor = 0.5
+	minTTFTTPOTWeightFactor     = 0.0
+	maxTTFTTPOTWeightFactor     = 1.0
+)
 
 // MaxScore is the highest possible score a pod can receive
 const MaxScore = 100.0
@@ -40,16 +46,51 @@ type LeastLatency struct {
 }
 
 type LeastLatencyArgs struct {
+	// TTFTTPOTWeightFactor must be between 0 and 1. A value of 0 prioritizes
+	// TPOT, 1 prioritizes TTFT, and values in between blend both metrics.
 	TTFTTPOTWeightFactor float64 `yaml:"TTFTTPOTWeightFactor,omitempty"`
 }
 
+// ValidateLeastLatencyArgs validates least-latency plugin arguments supplied
+// through router configuration.
+func ValidateLeastLatencyArgs(pluginArg runtime.RawExtension) error {
+	if len(pluginArg.Raw) == 0 {
+		return nil
+	}
+
+	leastLatencyArgs := LeastLatencyArgs{
+		TTFTTPOTWeightFactor: defaultTTFTTPOTWeightFactor,
+	}
+	if err := yaml.Unmarshal(pluginArg.Raw, &leastLatencyArgs); err != nil {
+		return fmt.Errorf("unmarshal least-latency arguments: %w", err)
+	}
+
+	weight := leastLatencyArgs.TTFTTPOTWeightFactor
+	if math.IsNaN(weight) || math.IsInf(weight, 0) ||
+		weight < minTTFTTPOTWeightFactor || weight > maxTTFTTPOTWeightFactor {
+		return fmt.Errorf("TTFTTPOTWeightFactor must be a finite value between %v and %v, got %v",
+			minTTFTTPOTWeightFactor, maxTTFTTPOTWeightFactor, weight)
+	}
+	return nil
+}
+
 func NewLeastLatency(pluginArg runtime.RawExtension) *LeastLatency {
-	var leastLatencyArgs LeastLatencyArgs
-	if yaml.Unmarshal(pluginArg.Raw, &leastLatencyArgs) != nil {
-		klog.Errorf("Unmarshal LeastLatencyArgs error, setting default value")
-		leastLatencyArgs = LeastLatencyArgs{
-			0.5,
+	leastLatencyArgs := LeastLatencyArgs{
+		TTFTTPOTWeightFactor: defaultTTFTTPOTWeightFactor,
+	}
+	if len(pluginArg.Raw) > 0 {
+		if err := yaml.Unmarshal(pluginArg.Raw, &leastLatencyArgs); err != nil {
+			klog.Errorf("Unmarshal LeastLatencyArgs error, setting default value: %v", err)
 		}
+	}
+
+	if math.IsNaN(leastLatencyArgs.TTFTTPOTWeightFactor) ||
+		math.IsInf(leastLatencyArgs.TTFTTPOTWeightFactor, 0) ||
+		leastLatencyArgs.TTFTTPOTWeightFactor < minTTFTTPOTWeightFactor ||
+		leastLatencyArgs.TTFTTPOTWeightFactor > maxTTFTTPOTWeightFactor {
+		klog.Warningf("Invalid TTFTTPOTWeightFactor %v, using default value %v",
+			leastLatencyArgs.TTFTTPOTWeightFactor, defaultTTFTTPOTWeightFactor)
+		leastLatencyArgs.TTFTTPOTWeightFactor = defaultTTFTTPOTWeightFactor
 	}
 
 	return &LeastLatency{
@@ -65,7 +106,7 @@ func (l *LeastLatency) Name() string {
 // Score calculates a score for each pod based on their inference latency:
 func (l *LeastLatency) Score(ctx *framework.Context, pods []*datastore.PodInfo) map[*datastore.PodInfo]int {
 	// Stores the computed score for each pod
-	scoreResults := make(map[*datastore.PodInfo]int)
+	scoreResults := make(map[*datastore.PodInfo]int, len(pods))
 	// Handle edge case: empty pod list
 	if len(pods) == 0 {
 		return scoreResults
@@ -78,10 +119,17 @@ func (l *LeastLatency) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	// 2. Second pass: Compute scores using linear normalization
 	// Note: If all pods have identical latency (max == min), all pods get MaxScore
 	for _, info := range pods {
-		scoreTTFT := MaxScore
-		scoreTPOT := MaxScore
 		ttft := info.GetTTFT()
 		tpot := info.GetTPOT()
+		// Pods with no observed latency yet (zero default) are uninitialized — assign a
+		// neutral mid-range score so they receive some traffic via other plugins without
+		// monopolizing dispatch ahead of warm, measured replicas.
+		if ttft <= 0 || tpot <= 0 {
+			scoreResults[info] = int(MaxScore / 2)
+			continue
+		}
+		scoreTTFT := MaxScore
+		scoreTPOT := MaxScore
 		// Only compute normalized score if there's variance in latency values
 		if maxTTFT > minTTFT {
 			scoreTTFT = MaxScore * (maxTTFT - ttft) / (maxTTFT - minTTFT)
@@ -104,8 +152,8 @@ func calculateMinMaxMetrics(pods []*datastore.PodInfo) (minTTFT, maxTTFT, minTPO
 	for _, info := range pods {
 		ttft := info.GetTTFT()
 		tpot := info.GetTPOT()
-		// Skip pods with invalid values
-		if ttft < 0 || tpot < 0 {
+		// Skip pods with no observed data (zero is the uninitialized default, not a valid measurement)
+		if ttft <= 0 || tpot <= 0 {
 			continue
 		}
 

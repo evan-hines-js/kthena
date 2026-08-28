@@ -16,6 +16,9 @@ spec:
         entryTemplate:
           metadata: ${SERVER_ENTRY_TEMPLATE_METADATA}
           spec:
+            runtimeClassName: ${RUNTIME_CLASS_NAME}
+            affinity: ${PREFILL_AFFINITY}
+            tolerations: ${PREFILL_TOLERATIONS}
             initContainers: ${INIT_CONTAINERS}
             containers:
               - name: runtime
@@ -39,7 +42,7 @@ spec:
               - name: vllm
                 image: ${ENGINE_PREFILL_IMAGE}
                 ports:
-                  - containerPort: 8000
+                  - containerPort: ${ENGINE_PORT}
                 env: ${ENGINE_PREFILL_ENV}
                 command: ${ENGINE_PREFILL_COMMAND}
                 imagePullPolicy: IfNotPresent
@@ -50,14 +53,14 @@ spec:
                   failureThreshold: 3
                   httpGet:
                     path: /health
-                    port: 8000
+                    port: ${ENGINE_PORT}
                 livenessProbe:
                   initialDelaySeconds: 180
                   periodSeconds: 5
                   failureThreshold: 3
                   httpGet:
                     path: /health
-                    port: 8000
+                    port: ${ENGINE_PORT}
                 volumeMounts: ${VOLUME_MOUNTS}
             volumes: ${VOLUMES}
         workerReplicas: 0
@@ -69,6 +72,9 @@ spec:
         entryTemplate:
           metadata: ${SERVER_ENTRY_TEMPLATE_METADATA}
           spec:
+            runtimeClassName: ${RUNTIME_CLASS_NAME}
+            affinity: ${DECODE_AFFINITY}
+            tolerations: ${DECODE_TOLERATIONS}
             initContainers: ${INIT_CONTAINERS}
             containers:
               - name: runtime
@@ -93,7 +99,7 @@ spec:
               - name: vllm
                 image: ${ENGINE_DECODE_IMAGE}
                 ports:
-                  - containerPort: 8000
+                  - containerPort: ${ENGINE_PORT}
                 env: ${ENGINE_DECODE_ENV}
                 command: ${ENGINE_DECODE_COMMAND}
                 imagePullPolicy: IfNotPresent
@@ -104,14 +110,14 @@ spec:
                   failureThreshold: 3
                   httpGet:
                     path: /health
-                    port: 8000
+                    port: ${ENGINE_PORT}
                 livenessProbe:
                   initialDelaySeconds: 180
                   periodSeconds: 5
                   failureThreshold: 3
                   httpGet:
                     path: /health
-                    port: 8000
+                    port: ${ENGINE_PORT}
                 volumeMounts: ${VOLUME_MOUNTS}
             volumes: ${VOLUMES}
         workerReplicas: 0

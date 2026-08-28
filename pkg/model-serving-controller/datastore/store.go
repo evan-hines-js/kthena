@@ -30,23 +30,28 @@ import (
 
 // Store is an interface for storing and retrieving data
 type Store interface {
+	// GetServingGroupByModelServing returns the sorted serving groups
 	GetServingGroupByModelServing(modelServingName types.NamespacedName) ([]ServingGroup, error)
 	GetServingGroupRevision(modelServingName types.NamespacedName, groupName string) (string, bool)
 	GetRunningPodNumByServingGroup(modelServingName types.NamespacedName, groupName string) (int, error)
 	GetServingGroupStatus(modelServingName types.NamespacedName, groupName string) ServingGroupStatus
 	GetRoleList(modelServingName types.NamespacedName, groupName, roleName string) ([]Role, error)
+	GetRolesByGroup(modelServingName types.NamespacedName, groupName string) (map[string]map[string]*Role, error)
 	GetRoleStatus(modelServingName types.NamespacedName, groupName, roleName, roleID string) RoleStatus
 	UpdateRoleStatus(modelServingName types.NamespacedName, groupName, roleName, roleID string, status RoleStatus) error
 	DeleteRole(modelServingName types.NamespacedName, groupName, roleName, roleID string)
 	DeleteModelServing(modelServingName types.NamespacedName)
 	DeleteServingGroup(modelServingName types.NamespacedName, groupName string)
 	AddServingGroup(modelServingName types.NamespacedName, idx int, revision string)
-	AddRole(modelServingName types.NamespacedName, groupName, roleName, roleID, revision string)
-	AddRunningPodToServingGroup(modelServingName types.NamespacedName, groupName, pod, revision, roleName, roleID string)
+	AddRole(modelServingName types.NamespacedName, groupName, roleName, roleID, revision, roleTemplateHash string)
+	AddRunningPodToServingGroup(modelServingName types.NamespacedName, groupName, pod, revision, roleTemplateHash, roleName, roleID string)
 	// AddServingGroupAndRole adds servingGroup and role if not exist
-	AddServingGroupAndRole(modelServingName types.NamespacedName, servingGroupName, revision, roleName, roleID string)
+	AddServingGroupAndRole(modelServingName types.NamespacedName, servingGroupName, revision, roleTemplateHash, roleName, roleID string)
 	DeleteRunningPodFromServingGroup(modelServingName types.NamespacedName, groupName string, pod string)
 	UpdateServingGroupStatus(modelServingName types.NamespacedName, groupName string, Status ServingGroupStatus) error
+	UpdateServingGroupRevision(modelServingName types.NamespacedName, groupName string, revision string) error
+	// DumpCache returns a JSON dump of the current store cache representation, which is useful for debugging and monitoring purposes. The structure of the JSON will be a map of modelServing names to their ServingGroups, and each ServingGroup will include its roles and running pods.
+	DumpCache() ([]byte, error)
 }
 
 type store struct {
@@ -66,9 +71,10 @@ type ServingGroup struct {
 }
 
 type Role struct {
-	Name     string
-	Revision string
-	Status   RoleStatus
+	Name             string
+	Revision         string // Revision of the ServingGroup
+	RoleTemplateHash string // Revision of the Role, used for RoleRollingUpdate strategy
+	Status           RoleStatus
 }
 
 type ServingGroupStatus string
@@ -154,6 +160,34 @@ func (s *store) GetRoleList(modelServingName types.NamespacedName, groupName, ro
 	})
 
 	return roleSlice, nil
+}
+
+func (s *store) GetRolesByGroup(modelServingName types.NamespacedName, groupName string) (map[string]map[string]*Role, error) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	servingGroups, ok := s.servingGroup[modelServingName]
+	if !ok {
+		return nil, fmt.Errorf("cannot find modelServing %s", modelServingName.Name)
+	}
+	servingGroup, ok := servingGroups[groupName]
+	if !ok {
+		return nil, fmt.Errorf("cannot find servingGroup %s", groupName)
+	}
+
+	// Return a snapshot copy of the roles map to avoid concurrent map access issues.
+	copiedRoles := make(map[string]map[string]*Role, len(servingGroup.roles))
+	for roleName, roleMap := range servingGroup.roles {
+		if roleMap == nil {
+			continue
+		}
+		copiedInner := make(map[string]*Role, len(roleMap))
+		for roleID, role := range roleMap {
+			roleCopy := *role
+			copiedInner[roleID] = &roleCopy
+		}
+		copiedRoles[roleName] = copiedInner
+	}
+	return copiedRoles, nil
 }
 
 // UpdateRoleStatus updates the status of a specific role
@@ -307,7 +341,7 @@ func (s *store) AddServingGroup(modelServingName types.NamespacedName, idx int, 
 }
 
 // AddRole adds a new role to an ServingGroup
-func (s *store) AddRole(modelServingName types.NamespacedName, groupName, roleName, roleID, revision string) {
+func (s *store) AddRole(modelServingName types.NamespacedName, groupName, roleName, roleID, revision, roleTemplateHash string) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
@@ -338,15 +372,16 @@ func (s *store) AddRole(modelServingName types.NamespacedName, groupName, roleNa
 		}
 	} else {
 		group.roles[roleName][roleID] = &Role{
-			Name:     roleID,
-			Status:   RoleCreating,
-			Revision: revision,
+			Name:             roleID,
+			Status:           RoleCreating,
+			Revision:         revision,
+			RoleTemplateHash: roleTemplateHash,
 		}
 	}
 }
 
 // AddRunningPodToServingGroup add ServingGroup in runningPodOfServingGroup map
-func (s *store) AddRunningPodToServingGroup(modelServingName types.NamespacedName, servingGroupName, runningPodName, revision, roleName, roleID string) {
+func (s *store) AddRunningPodToServingGroup(modelServingName types.NamespacedName, servingGroupName, runningPodName, revision, roleTemplateHash, roleName, roleID string) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	if _, ok := s.servingGroup[modelServingName]; !ok {
@@ -377,16 +412,17 @@ func (s *store) AddRunningPodToServingGroup(modelServingName types.NamespacedNam
 
 	if _, ok = group.roles[roleName][roleID]; !ok {
 		role := &Role{
-			Name:     roleID,
-			Status:   RoleCreating,
-			Revision: revision,
+			Name:             roleID,
+			Status:           RoleCreating,
+			Revision:         revision,
+			RoleTemplateHash: roleTemplateHash,
 		}
 		group.roles[roleName][roleID] = role
 	}
 }
 
 // AddServingGroupAndRole adds ServingGroup and roles if not exist
-func (s *store) AddServingGroupAndRole(modelServingName types.NamespacedName, servingGroupName, revision, roleName, roleID string) {
+func (s *store) AddServingGroupAndRole(modelServingName types.NamespacedName, servingGroupName, revision, roleTemplateHash, roleName, roleID string) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	if _, ok := s.servingGroup[modelServingName]; !ok {
@@ -415,9 +451,10 @@ func (s *store) AddServingGroupAndRole(modelServingName types.NamespacedName, se
 
 	if _, ok = group.roles[roleName][roleID]; !ok {
 		role := &Role{
-			Name:     roleID,
-			Status:   RoleCreating,
-			Revision: revision,
+			Name:             roleID,
+			Status:           RoleCreating,
+			Revision:         revision,
+			RoleTemplateHash: roleTemplateHash,
 		}
 		group.roles[roleName][roleID] = role
 	}
@@ -446,6 +483,24 @@ func (s *store) UpdateServingGroupStatus(modelServingName types.NamespacedName, 
 	}
 	if group, ok := groups[groupName]; ok {
 		group.Status = status
+		groups[groupName] = group
+	} else {
+		return fmt.Errorf("failed to find ServingGroup %s in modelServing %s", groupName, modelServingName.Namespace+"/"+modelServingName.Name)
+	}
+	return nil
+}
+
+// UpdateServingGroupRevision updates the revision of a ServingGroup
+func (s *store) UpdateServingGroupRevision(modelServingName types.NamespacedName, groupName string, revision string) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	groups, ok := s.servingGroup[modelServingName]
+	if !ok {
+		return fmt.Errorf("failed to find modelServing %s", modelServingName.Namespace+"/"+modelServingName.Name)
+	}
+	if group, ok := groups[groupName]; ok {
+		group.Revision = revision
 		groups[groupName] = group
 	} else {
 		return fmt.Errorf("failed to find ServingGroup %s in modelServing %s", groupName, modelServingName.Namespace+"/"+modelServingName.Name)

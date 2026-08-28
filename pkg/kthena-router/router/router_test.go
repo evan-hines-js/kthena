@@ -18,166 +18,703 @@ package router
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/agiledragon/gomonkey/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+
+	inferencev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/accesslog"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/connectors"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/datastore"
-	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/providers"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/framework"
-	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/plugins/conf"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
 
 func TestMain(m *testing.M) {
 	gin.SetMode(gin.TestMode)
 	klog.InitFlags(nil)
-	// Set klog verbosity level to 4
 	flag.Set("v", "4")
-	flag.Parse() // Parse flags to apply the klog level
-	routerConfig, _ := conf.ParseRouterConfig("../scheduler/testdata/configmap.yaml")
-	patch1 := gomonkey.ApplyFunc(conf.ParseRouterConfig, func(configMapPath string) (*conf.RouterConfiguration, error) {
-		return routerConfig, nil
-	})
-	defer patch1.Reset()
-
-	pluginsWeight, plugins, pluginConfig, _ := conf.LoadSchedulerConfig(&routerConfig.Scheduler)
-	patch2 := gomonkey.ApplyFunc(conf.LoadSchedulerConfig, func() (map[string]int, []string, map[string]runtime.RawExtension, error) {
-		return pluginsWeight, plugins, pluginConfig, nil
-	})
-	defer patch2.Reset()
-
-	// Run the tests
+	flag.Parse()
 	exitCode := m.Run()
-	// Exit with the appropriate code
 	os.Exit(exitCode)
 }
 
-func buildPodInfo(name string, ip string) *datastore.PodInfo {
-	pod := &corev1.Pod{
-		ObjectMeta: v1.ObjectMeta{
-			Name: name,
+func withMetricsEndpoint(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+			fmt.Fprint(w, "# TYPE up gauge\nup 1\n")
+			return
+		}
+		if r.URL.Path == "/v1/models" {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
+		if r.URL.Path != "/v1/chat/completions" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+}
+
+type closeNotifyRecorder struct {
+	*httptest.ResponseRecorder
+	closeCh chan bool
+}
+
+func (r *closeNotifyRecorder) CloseNotify() <-chan bool {
+	return r.closeCh
+}
+
+// setupTestRouter initializes a router and its dependencies for testing.
+// It uses a mock HTTP server as the backend, following the community's recommendation
+// to avoid hacky dependency injection.
+func setupTestRouter(t *testing.T, backendHandler http.Handler) (*Router, datastore.Store, *httptest.Server) {
+	gin.SetMode(gin.TestMode)
+
+	backend := httptest.NewServer(withMetricsEndpoint(backendHandler))
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+
+	return router, store, backend
+}
+
+type modelServerDeletedStore struct {
+	datastore.Store
+	modelServer *aiv1alpha1.ModelServer
+}
+
+func (s *modelServerDeletedStore) GetModelServer(types.NamespacedName) *aiv1alpha1.ModelServer {
+	return s.modelServer
+}
+
+func (s *modelServerDeletedStore) GetPodsByModelServer(name types.NamespacedName) ([]*datastore.PodInfo, error) {
+	return nil, fmt.Errorf("model server not found: %v", name)
+}
+
+type inferencePoolDeletedStore struct {
+	datastore.Store
+	inferencePool *inferencev1.InferencePool
+	getCalls      atomic.Int32
+}
+
+func (s *inferencePoolDeletedStore) GetInferencePool(string) *inferencev1.InferencePool {
+	if s.getCalls.Add(1) == 1 {
+		return s.inferencePool
+	}
+	return nil
+}
+
+func (s *inferencePoolDeletedStore) GetPodsByInferencePool(name types.NamespacedName) ([]*datastore.PodInfo, error) {
+	return nil, fmt.Errorf("inferencepool not found: %v", name)
+}
+
+func TestRouter_HandleHTTPRoute_PathPrefix(t *testing.T) {
+	pathType := gatewayv1.PathMatchPathPrefix
+	kind := gatewayv1.Kind("Gateway")
+	group := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
+
+	tests := []struct {
+		name           string
+		prefix         string
+		path           string
+		defaultType    bool
+		defaultValue   bool
+		expectedMatch  bool
+		expectedPrefix string
+	}{
+		{
+			name:           "root matches root",
+			prefix:         "/",
+			path:           "/",
+			expectedMatch:  true,
+			expectedPrefix: "/",
 		},
-		Status: corev1.PodStatus{
-			PodIP: ip,
+		{
+			name:           "root matches nested path",
+			prefix:         "/",
+			path:           "/foo/bar",
+			expectedMatch:  true,
+			expectedPrefix: "/",
+		},
+		{
+			name:           "prefix matches exact path",
+			prefix:         "/foo",
+			path:           "/foo",
+			expectedMatch:  true,
+			expectedPrefix: "/foo",
+		},
+		{
+			name:           "prefix matches path with trailing slash",
+			prefix:         "/foo",
+			path:           "/foo/",
+			expectedMatch:  true,
+			expectedPrefix: "/foo",
+		},
+		{
+			name:           "prefix matches nested path element",
+			prefix:         "/foo",
+			path:           "/foo/bar",
+			expectedMatch:  true,
+			expectedPrefix: "/foo",
+		},
+		{
+			name:           "trailing slash prefix matches exact path",
+			prefix:         "/foo/",
+			path:           "/foo",
+			expectedMatch:  true,
+			expectedPrefix: "/foo",
+		},
+		{
+			name:           "trailing slash prefix matches nested path",
+			prefix:         "/foo/",
+			path:           "/foo/bar",
+			expectedMatch:  true,
+			expectedPrefix: "/foo",
+		},
+		{
+			name:          "prefix does not match partial segment",
+			prefix:        "/foo",
+			path:          "/foobar",
+			expectedMatch: false,
+		},
+		{
+			name:          "prefix does not match partial nested segment",
+			prefix:        "/foo",
+			path:          "/foo-bar/baz",
+			expectedMatch: false,
+		},
+		{
+			name:          "prefix with more path elements does not match shorter path",
+			prefix:        "/a/b/c",
+			path:          "/abc",
+			expectedMatch: false,
+		},
+		{
+			name:          "prefix with one path element does not match nested path text",
+			prefix:        "/abc",
+			path:          "/a/b/c",
+			expectedMatch: false,
+		},
+		{
+			name:          "prefix matching is case sensitive",
+			prefix:        "/foo",
+			path:          "/Foo",
+			expectedMatch: false,
+		},
+		{
+			name:           "missing type defaults to path prefix",
+			prefix:         "/foo",
+			path:           "/foo/bar",
+			defaultType:    true,
+			expectedMatch:  true,
+			expectedPrefix: "/foo",
+		},
+		{
+			name:           "missing value defaults to root",
+			path:           "/foo/bar",
+			defaultValue:   true,
+			expectedMatch:  true,
+			expectedPrefix: "/",
 		},
 	}
 
-	return &datastore.PodInfo{
-		Pod: pod,
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := datastore.New()
+			router := &Router{store: store}
+			pathMatch := &gatewayv1.HTTPPathMatch{}
+			if !tt.defaultType {
+				pathMatch.Type = &pathType
+			}
+			if !tt.defaultValue {
+				pathMatch.Value = &tt.prefix
+			}
+			route := &gatewayv1.HTTPRoute{
+				ObjectMeta: v1.ObjectMeta{Name: "route", Namespace: "default"},
+				Spec: gatewayv1.HTTPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{
+						ParentRefs: []gatewayv1.ParentReference{
+							{
+								Name: "gw",
+								Kind: &kind,
+							},
+						},
+					},
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Matches: []gatewayv1.HTTPRouteMatch{
+								{
+									Path: pathMatch,
+								},
+							},
+							BackendRefs: []gatewayv1.HTTPBackendRef{
+								{
+									BackendRef: gatewayv1.BackendRef{
+										BackendObjectReference: gatewayv1.BackendObjectReference{
+											Group: &group,
+											Kind:  &backendKind,
+											Name:  "pool",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			assert.NoError(t, store.AddOrUpdateHTTPRoute(route))
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, tt.path, nil)
+
+			matched, pool, err := router.handleHTTPRoute(c, "default/gw")
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expectedMatch, matched)
+			if !tt.expectedMatch {
+				return
+			}
+			assert.Equal(t, types.NamespacedName{Namespace: "default", Name: "pool"}, pool)
+			prefix, exists := c.Get("matchedPrefix")
+			assert.True(t, exists)
+			assert.Equal(t, tt.expectedPrefix, prefix)
+		})
 	}
 }
 
-func TestProxyModelEndpoint(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	req, _ := http.NewRequest("POST", "/", nil)
-	modelReq := ModelRequest{"model": "test"}
-	r := NewRouter(datastore.New(), "testdata/comfigmap.yaml")
-	hookPatch := gomonkey.ApplyMethod(r.scheduler, "RunPostHooks", func(s scheduler.Scheduler, ctx *framework.Context, index int) {})
-	defer hookPatch.Reset()
-
-	tests := []struct {
-		name       string
-		ctx        *framework.Context
-		proxyPatch func() *gomonkey.Patches
-		wantErr    error
-	}{
-		{
-			name: "BestPods are set, aggregated mode success",
-			ctx: &framework.Context{
-				Model:    "test",
-				Prompt:   common.ChatMessage{Text: "test"},
-				BestPods: []*datastore.PodInfo{buildPodInfo("decode1", "1.1.1.1")},
+func TestRouter_HandleHTTPRoute_UsesMatchedRuleBackend(t *testing.T) {
+	pathType := gatewayv1.PathMatchPathPrefix
+	kind := gatewayv1.Kind("Gateway")
+	group := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
+	prefixA := "/a"
+	prefixB := "/b"
+	store := datastore.New()
+	router := &Router{store: store}
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "gw",
+						Kind: &kind,
+					},
+				},
 			},
-			proxyPatch: func() *gomonkey.Patches {
-				patches := gomonkey.ApplyFunc(connectors.BuildDecodeRequest, func(c *gin.Context, req *http.Request, modelRequest ModelRequest) *http.Request {
-					return req
-				})
-				patches.ApplyFunc(isStreaming, func(modelRequest ModelRequest) bool {
-					return false
-				})
-				patches.ApplyFunc(proxyRequest, func(c *gin.Context, req *http.Request, podIP string, port int32, stream bool) error {
-					return nil
-				})
-				return patches
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &prefixA,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-a",
+								},
+							},
+						},
+					},
+				},
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &prefixB,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-b",
+								},
+							},
+						},
+					},
+				},
 			},
-			wantErr: nil,
-		},
-		{
-			name: "BestPods proxy returns error",
-			ctx: &framework.Context{
-				Model:    "test",
-				Prompt:   common.ChatMessage{Text: "test"},
-				BestPods: []*datastore.PodInfo{buildPodInfo("decode1", "1.1.1.1")},
-			},
-			proxyPatch: func() *gomonkey.Patches {
-				patches := gomonkey.ApplyFunc(connectors.BuildDecodeRequest, func(c *gin.Context, req *http.Request, modelRequest ModelRequest) *http.Request {
-					return req
-				})
-				patches.ApplyFunc(isStreaming, func(modelRequest ModelRequest) bool {
-					return false
-				})
-				patches.ApplyFunc(proxyRequest, func(c *gin.Context, req *http.Request, podIP string, port int32, stream bool) error {
-					return errors.New("proxy error")
-				})
-				return patches
-			},
-			wantErr: errors.New("request to all pods failed"),
 		},
 	}
+	assert.NoError(t, store.AddOrUpdateHTTPRoute(route))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/b/chat", nil)
+
+	matched, pool, err := router.handleHTTPRoute(c, "default/gw")
+	assert.NoError(t, err)
+	assert.True(t, matched)
+	assert.Equal(t, types.NamespacedName{Namespace: "default", Name: "pool-b"}, pool)
+}
+
+func TestRouter_HandleHTTPRoute_PrefersLongestPrefix(t *testing.T) {
+	pathType := gatewayv1.PathMatchPathPrefix
+	kind := gatewayv1.Kind("Gateway")
+	group := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
+	rootPrefix := "/"
+	chatPrefix := "/chat"
+	store := datastore.New()
+	router := &Router{store: store}
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "gw",
+						Kind: &kind,
+					},
+				},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &rootPrefix,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-root",
+								},
+							},
+						},
+					},
+				},
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &chatPrefix,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-chat",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.NoError(t, store.AddOrUpdateHTTPRoute(route))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/chat/completions", nil)
+
+	matched, pool, err := router.handleHTTPRoute(c, "default/gw")
+	assert.NoError(t, err)
+	assert.True(t, matched)
+	assert.Equal(t, types.NamespacedName{Namespace: "default", Name: "pool-chat"}, pool)
+	prefix, exists := c.Get("matchedPrefix")
+	assert.True(t, exists)
+	assert.Equal(t, "/chat", prefix)
+}
+
+func TestRouter_HandleHTTPRoute_UsesMatchedRuleURLRewrite(t *testing.T) {
+	pathType := gatewayv1.PathMatchPathPrefix
+	rewriteType := gatewayv1.PrefixMatchHTTPPathModifier
+	kind := gatewayv1.Kind("Gateway")
+	group := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
+	prefixA := "/a"
+	prefixB := "/b"
+	wrongPrefix := "/wrong"
+	rightPrefix := "/right"
+	store := datastore.New()
+	router := &Router{store: store}
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "gw",
+						Kind: &kind,
+					},
+				},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &prefixA,
+							},
+						},
+					},
+					Filters: []gatewayv1.HTTPRouteFilter{
+						{
+							Type: gatewayv1.HTTPRouteFilterURLRewrite,
+							URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+								Path: &gatewayv1.HTTPPathModifier{
+									Type:               rewriteType,
+									ReplacePrefixMatch: &wrongPrefix,
+								},
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-a",
+								},
+							},
+						},
+					},
+				},
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &prefixB,
+							},
+						},
+					},
+					Filters: []gatewayv1.HTTPRouteFilter{
+						{
+							Type: gatewayv1.HTTPRouteFilterURLRewrite,
+							URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+								Path: &gatewayv1.HTTPPathModifier{
+									Type:               rewriteType,
+									ReplacePrefixMatch: &rightPrefix,
+								},
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-b",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.NoError(t, store.AddOrUpdateHTTPRoute(route))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/b/chat", nil)
+
+	matched, pool, err := router.handleHTTPRoute(c, "default/gw")
+	assert.NoError(t, err)
+	assert.True(t, matched)
+	assert.Equal(t, types.NamespacedName{Namespace: "default", Name: "pool-b"}, pool)
+	assert.Equal(t, "/right/chat", c.Request.URL.Path)
+}
+
+func TestRouter_HandleHTTPRoute_HostnameMatch(t *testing.T) {
+	pathType := gatewayv1.PathMatchPathPrefix
+	kind := gatewayv1.Kind("Gateway")
+	group := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
+	path := "/chat"
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "gw",
+						Kind: &kind,
+					},
+				},
+			},
+			Hostnames: []gatewayv1.Hostname{"api.example.com"},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &path,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	wildcardRoute := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "wildcard-route",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "gw",
+						Kind: &kind,
+					},
+				},
+			},
+			Hostnames: []gatewayv1.Hostname{"*.example.com"},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  &pathType,
+								Value: &path,
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &group,
+									Kind:  &backendKind,
+									Name:  "pool-wildcard",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name          string
+		routes        []*gatewayv1.HTTPRoute
+		host          string
+		expectedMatch bool
+		expectedPool  types.NamespacedName
+	}{
+		{
+			name:          "hostname matches",
+			routes:        []*gatewayv1.HTTPRoute{route},
+			host:          "api.example.com:8080",
+			expectedMatch: true,
+			expectedPool:  types.NamespacedName{Namespace: "default", Name: "pool"},
+		},
+		{
+			name:          "hostname mismatch",
+			routes:        []*gatewayv1.HTTPRoute{route},
+			host:          "other.example.com",
+			expectedMatch: false,
+		},
+		{
+			name:          "wildcard hostname matches",
+			routes:        []*gatewayv1.HTTPRoute{wildcardRoute},
+			host:          "api.example.com",
+			expectedMatch: true,
+			expectedPool:  types.NamespacedName{Namespace: "default", Name: "pool-wildcard"},
+		},
+	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var patch *gomonkey.Patches
-			if tt.proxyPatch != nil {
-				patch = tt.proxyPatch()
-				defer patch.Reset()
+			store := datastore.New()
+			router := &Router{store: store}
+			for _, route := range tt.routes {
+				assert.NoError(t, store.AddOrUpdateHTTPRoute(route))
 			}
-			err := r.proxyModelEndpoint(c, req, tt.ctx, modelReq, int32(8080))
-			if tt.wantErr != nil {
-				assert.Error(t, err)
-				assert.Equal(t, tt.wantErr.Error(), err.Error())
-			} else {
-				assert.NoError(t, err)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/chat", nil)
+			c.Request.Host = tt.host
+
+			matched, pool, err := router.handleHTTPRoute(c, "default/gw")
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expectedMatch, matched)
+			if tt.expectedMatch {
+				assert.Equal(t, tt.expectedPool, pool)
 			}
 		})
 	}
 }
 
-// setupTestRouter initializes a router and its dependencies for testing.
-func setupTestRouter(backendHandler http.Handler) (*Router, datastore.Store, *httptest.Server) {
-	gin.SetMode(gin.TestMode)
-
-	backend := httptest.NewServer(backendHandler)
-	store := datastore.New()
-	router := NewRouter(store, "")
-
-	return router, store, backend
-}
-
 func TestRouter_HandlerFunc_AggregatedMode(t *testing.T) {
-	// 1. Setup backend mock
+	// 1. Setup backend mock server
 	backendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/v1/chat/completions", r.URL.Path)
 		body, _ := io.ReadAll(r.Body)
@@ -187,7 +724,7 @@ func TestRouter_HandlerFunc_AggregatedMode(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, `{"id":"response-id"}`)
 	})
-	router, store, backend := setupTestRouter(backendHandler)
+	router, store, backend := setupTestRouter(t, backendHandler)
 	defer backend.Close()
 
 	backendURL, _ := url.Parse(backend.URL)
@@ -233,6 +770,7 @@ func TestRouter_HandlerFunc_AggregatedMode(t *testing.T) {
 	reqBody := `{"model": "test-model", "prompt": "hello"}`
 	c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
 	c.Request.Header.Set("Content-Type", "application/json")
+	requestsBefore := requestCounterValue(t, router, "test-model", "/v1/chat/completions", "200", "successful_request")
 
 	// 4. Execute handler
 	router.HandlerFunc()(c)
@@ -240,10 +778,818 @@ func TestRouter_HandlerFunc_AggregatedMode(t *testing.T) {
 	// 5. Assertions
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"id":"response-id"`)
+	assert.Equal(t, float64(1), requestCounterValue(t, router, "test-model", "/v1/chat/completions", "200", "successful_request")-requestsBefore)
+}
+
+func TestRouter_HandlerFunc_InferencePoolAccessLogDestination(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	backendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var reqBody ModelRequest
+		json.Unmarshal(body, &reqBody)
+		assert.Equal(t, "pool-model", reqBody["model"])
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"pool-response"}`)
+	})
+	router, store, backend := setupTestRouter(t, backendHandler)
+	defer backend.Close()
+
+	backendURL, _ := url.Parse(backend.URL)
+	backendPort, _ := strconv.Atoi(backendURL.Port())
+	pool := &inferencev1.InferencePool{
+		ObjectMeta: v1.ObjectMeta{Name: "pool", Namespace: "default"},
+		Spec: inferencev1.InferencePoolSpec{
+			TargetPorts: []inferencev1.Port{{Number: inferencev1.PortNumber(backendPort)}},
+			Selector: inferencev1.LabelSelector{MatchLabels: map[inferencev1.LabelKey]inferencev1.LabelValue{
+				"app": "pool",
+			}},
+			EndpointPickerRef: inferencev1.EndpointPickerRef{Name: "pool-picker"},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "pool-pod",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "pool"},
+		},
+		Status: corev1.PodStatus{PodIP: backendURL.Hostname(), Phase: corev1.PodRunning},
+	}
+	pathType := gatewayv1.PathMatchPathPrefix
+	pathPrefix := "/v1"
+	parentKind := gatewayv1.Kind("Gateway")
+	backendGroup := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "pool-route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{
+				Name: "gw",
+				Kind: &parentKind,
+			}}},
+			Rules: []gatewayv1.HTTPRouteRule{{
+				Matches: []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{
+					Type:  &pathType,
+					Value: &pathPrefix,
+				}}},
+				BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{
+					BackendObjectReference: gatewayv1.BackendObjectReference{
+						Group: &backendGroup,
+						Kind:  &backendKind,
+						Name:  "pool",
+					},
+				}}},
+			}},
+		},
+	}
+	assert.NoError(t, store.AddOrUpdateInferencePool(pool))
+	assert.NoError(t, store.AddOrUpdatePod(pod, nil))
+	assert.NoError(t, store.AddOrUpdateHTTPRoute(route))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"pool-model","prompt":"hello"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set(GatewayKey, "default/gw")
+	accessCtx := accesslog.NewAccessLogContext("pool-request", http.MethodPost, c.Request.URL.Path, c.Request.Proto, "pool-model")
+	c.Set(accesslog.AccessLogContextKey, accessCtx)
+
+	activeLabels := []string{
+		metrics.DestinationLabelValueNone,
+		metrics.DestinationLabelValueNone,
+		metrics.BackendTypeInferencePool,
+		"default/pool",
+		"pool-model",
+	}
+	activeBefore := externalGaugeValue(t, &router.metrics.ActiveUpstreamRequests, activeLabels...)
+	done := make(chan struct{})
+	go func() {
+		router.HandlerFunc()(c)
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("timed out waiting for inference pool upstream request")
+	}
+	assert.Equal(t, activeBefore+1, externalGaugeValue(t, &router.metrics.ActiveUpstreamRequests, activeLabels...))
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for inference pool request completion")
+	}
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, metrics.BackendTypeInferencePool, accessCtx.BackendType)
+	assert.Equal(t, "default/pool", accessCtx.BackendName)
+	assert.Equal(t, "pool-model", accessCtx.UpstreamModel)
+	assert.Equal(t, 1, accessCtx.UpstreamAttempts)
+	assert.Equal(t, http.StatusOK, accessCtx.UpstreamStatusCode)
+	assert.Equal(t, activeBefore, externalGaugeValue(t, &router.metrics.ActiveUpstreamRequests, activeLabels...))
+}
+
+func TestRouter_HandlerFunc_ExternalOpenAIProvider(t *testing.T) {
+	providerModel := "gpt-4o-mini"
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/chat/completions", r.URL.Path)
+		assert.Equal(t, "Bearer provider-key", r.Header.Get("Authorization"))
+		assert.Equal(t, "", r.Header.Get("Cookie"))
+
+		body, _ := io.ReadAll(r.Body)
+		var reqBody ModelRequest
+		assert.NoError(t, json.Unmarshal(body, &reqBody))
+		assert.Equal(t, providerModel, reqBody["model"])
+		assert.NotContains(t, reqBody, "include_usage")
+		assert.NotContains(t, reqBody, "stream_options")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"external-response","usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}`)
+	}))
+	defer upstream.Close()
+
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
+		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
+		Spec: aiv1alpha1.ExternalModelProviderSpec{
+			ProviderType:       aiv1alpha1.OpenAI,
+			BaseURL:            upstream.URL,
+			Model:              &providerModel,
+			InsecureSkipVerify: true,
+			Auth: &aiv1alpha1.ProviderAuth{
+				SecretRef: corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "provider-secret"},
+					Key:                  "api-key",
+				},
+			},
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateSecret(&corev1.Secret{
+		ObjectMeta: v1.ObjectMeta{Name: "provider-secret", Namespace: "default"},
+		Data: map[string][]byte{
+			"api-key": []byte("provider-key"),
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-external", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "external-model",
+			Rules: []*aiv1alpha1.Rule{
+				{
+					TargetModels: []*aiv1alpha1.TargetModel{
+						{ExternalModelProviderName: "openai-provider"},
+					},
+				},
+			},
+		},
+	}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	reqBody := `{"model":"external-model","messages":[{"role":"user","content":"hello"}]}`
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(reqBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer downstream")
+	c.Request.Header.Set("Cookie", "session=downstream")
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"id":"external-response"`)
+}
+
+func TestRouter_HandlerFunc_ExternalOpenAIResponsesProvider(t *testing.T) {
+	providerModel := "gpt-5.6-sol"
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/responses", r.URL.Path)
+		assert.Equal(t, "Bearer provider-key", r.Header.Get("Authorization"))
+
+		body, _ := io.ReadAll(r.Body)
+		var reqBody ModelRequest
+		assert.NoError(t, json.Unmarshal(body, &reqBody))
+		assert.Equal(t, providerModel, reqBody["model"])
+		assert.Equal(t, "Reply OK", reqBody["input"])
+		assert.Equal(t, false, reqBody["stream"])
+		assert.NotContains(t, reqBody, "include_usage")
+		assert.NotContains(t, reqBody, "stream_options")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"resp_1","object":"response","model":"gpt-5.6-sol","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}],"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}`)
+	}))
+	defer upstream.Close()
+
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
+		ObjectMeta: v1.ObjectMeta{Name: "responses-provider", Namespace: "default"},
+		Spec: aiv1alpha1.ExternalModelProviderSpec{
+			ProviderType:       aiv1alpha1.OpenAI,
+			BaseURL:            upstream.URL + "/v1",
+			Model:              &providerModel,
+			InsecureSkipVerify: true,
+			Auth: &aiv1alpha1.ProviderAuth{SecretRef: corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "responses-secret"},
+				Key:                  "api-key",
+			}},
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateSecret(&corev1.Secret{
+		ObjectMeta: v1.ObjectMeta{Name: "responses-secret", Namespace: "default"},
+		Data:       map[string][]byte{"api-key": []byte("provider-key")},
+	}))
+	assert.NoError(t, store.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "responses-route", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "responses-model",
+			Rules: []*aiv1alpha1.Rule{{TargetModels: []*aiv1alpha1.TargetModel{{
+				ExternalModelProviderName: "responses-provider",
+			}}}},
+		},
+	}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	reqBody := `{"model":"responses-model","input":"Reply OK","max_output_tokens":16,"stream":false}`
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(reqBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+	accessCtx := accesslog.NewAccessLogContext("responses-request", http.MethodPost, c.Request.URL.Path, c.Request.Proto, "responses-model")
+	c.Set(accesslog.AccessLogContextKey, accessCtx)
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"id":"resp_1"`)
+	assert.Equal(t, metrics.BackendTypeExternalProvider, accessCtx.BackendType)
+	assert.Equal(t, "default/responses-provider", accessCtx.BackendName)
+	assert.Equal(t, providerModel, accessCtx.UpstreamModel)
+	assert.Equal(t, 1, accessCtx.UpstreamAttempts)
+	assert.Equal(t, http.StatusOK, accessCtx.UpstreamStatusCode)
+	assert.Equal(t, 3, accessCtx.OutputTokens)
+}
+
+func TestRouter_HandlerFunc_ExternalAnthropicProvider(t *testing.T) {
+	providerModel := "claude-3-5-sonnet-latest"
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/messages", r.URL.Path)
+		assert.Equal(t, "provider-key", r.Header.Get("x-api-key"))
+		assert.Equal(t, "", r.Header.Get("Authorization"))
+		assert.Equal(t, "2023-06-01", r.Header.Get("anthropic-version"))
+
+		body, _ := io.ReadAll(r.Body)
+		var reqBody ModelRequest
+		assert.NoError(t, json.Unmarshal(body, &reqBody))
+		assert.Equal(t, providerModel, reqBody["model"])
+		assert.NotContains(t, reqBody, "include_usage")
+		assert.NotContains(t, reqBody, "stream_options")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"msg_1","type":"message","model":"claude","usage":{"input_tokens":7,"output_tokens":9}}`)
+	}))
+	defer upstream.Close()
+
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
+		ObjectMeta: v1.ObjectMeta{Name: "anthropic-provider", Namespace: "default"},
+		Spec: aiv1alpha1.ExternalModelProviderSpec{
+			ProviderType:       aiv1alpha1.Anthropic,
+			BaseURL:            upstream.URL,
+			Model:              &providerModel,
+			InsecureSkipVerify: true,
+			Auth: &aiv1alpha1.ProviderAuth{
+				SecretRef: corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "provider-secret"},
+					Key:                  "api-key",
+				},
+			},
+			Headers: map[string]string{
+				"anthropic-version": "2023-06-01",
+			},
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateSecret(&corev1.Secret{
+		ObjectMeta: v1.ObjectMeta{Name: "provider-secret", Namespace: "default"},
+		Data: map[string][]byte{
+			"api-key": []byte("provider-key"),
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-anthropic", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "anthropic-router",
+			Rules: []*aiv1alpha1.Rule{
+				{
+					TargetModels: []*aiv1alpha1.TargetModel{
+						{ExternalModelProviderName: "anthropic-provider"},
+					},
+				},
+			},
+		},
+	}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	reqBody := `{"model":"anthropic-router","messages":[{"role":"user","content":"hello"}],"max_tokens":64}`
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(reqBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer downstream")
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"id":"msg_1"`)
+}
+
+func TestRouter_HandlerFunc_ExternalProviderProtocolMismatch(t *testing.T) {
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
+		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
+		Spec: aiv1alpha1.ExternalModelProviderSpec{
+			ProviderType: aiv1alpha1.OpenAI,
+			BaseURL:      "https://api.openai.example",
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-external", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "external-model",
+			Rules: []*aiv1alpha1.Rule{
+				{
+					TargetModels: []*aiv1alpha1.TargetModel{
+						{ExternalModelProviderName: "openai-provider"},
+					},
+				},
+			},
+		},
+	}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	reqBody := `{"model":"external-model","messages":[{"role":"user","content":"hello"}]}`
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(reqBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	reason, ok := c.Get("finishReason")
+	assert.True(t, ok)
+	assert.Equal(t, "request_protocol", reason)
+}
+
+func TestRouter_HandlerFunc_ExternalProviderMissingSecret(t *testing.T) {
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
+		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
+		Spec: aiv1alpha1.ExternalModelProviderSpec{
+			ProviderType: aiv1alpha1.OpenAI,
+			BaseURL:      "https://api.openai.example",
+			Auth: &aiv1alpha1.ProviderAuth{
+				SecretRef: corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "provider-secret"},
+					Key:                  "api-key",
+				},
+			},
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-external", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "external-model",
+			Rules: []*aiv1alpha1.Rule{
+				{
+					TargetModels: []*aiv1alpha1.TargetModel{
+						{ExternalModelProviderName: "openai-provider"},
+					},
+				},
+			},
+		},
+	}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	reqBody := `{"model":"external-model","messages":[{"role":"user","content":"hello"}]}`
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(reqBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	reason, ok := c.Get("finishReason")
+	assert.True(t, ok)
+	assert.Equal(t, "provider_config", reason)
+}
+
+func TestRouter_HandlerFunc_ExternalProviderMissingSecretKey(t *testing.T) {
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
+		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
+		Spec: aiv1alpha1.ExternalModelProviderSpec{
+			ProviderType: aiv1alpha1.OpenAI,
+			BaseURL:      "https://api.openai.example",
+			Auth: &aiv1alpha1.ProviderAuth{
+				SecretRef: corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "provider-secret"},
+					Key:                  "api-key",
+				},
+			},
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateSecret(&corev1.Secret{
+		ObjectMeta: v1.ObjectMeta{Name: "provider-secret", Namespace: "default"},
+		Data: map[string][]byte{
+			"other": []byte("provider-key"),
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-external", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "external-model",
+			Rules: []*aiv1alpha1.Rule{
+				{
+					TargetModels: []*aiv1alpha1.TargetModel{
+						{ExternalModelProviderName: "openai-provider"},
+					},
+				},
+			},
+		},
+	}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	reqBody := `{"model":"external-model","messages":[{"role":"user","content":"hello"}]}`
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(reqBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	reason, ok := c.Get("finishReason")
+	assert.True(t, ok)
+	assert.Equal(t, "provider_config", reason)
+}
+
+func TestRouter_HandlerFunc_ExternalProviderPreservesRawBodyWhenUnchanged(t *testing.T) {
+	reqBody := `{"model":"anthropic-router","messages":[{"role":"user","content":"hello"}],"metadata":{"trace_id":9007199254740993123}}`
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		assert.Equal(t, reqBody, string(body))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"msg_1","type":"message","model":"claude","usage":{"input_tokens":7,"output_tokens":9}}`)
+	}))
+	defer upstream.Close()
+
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
+		ObjectMeta: v1.ObjectMeta{Name: "anthropic-provider", Namespace: "default"},
+		Spec: aiv1alpha1.ExternalModelProviderSpec{
+			ProviderType:       aiv1alpha1.Anthropic,
+			BaseURL:            upstream.URL,
+			InsecureSkipVerify: true,
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-anthropic", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "anthropic-router",
+			Rules: []*aiv1alpha1.Rule{
+				{
+					TargetModels: []*aiv1alpha1.TargetModel{
+						{ExternalModelProviderName: "anthropic-provider"},
+					},
+				},
+			},
+		},
+	}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(reqBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestRouter_HandlerFunc_ExternalProviderPassesThroughNon2xx(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"error":"rate limited"}`)
+	}))
+	defer upstream.Close()
+
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
+		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
+		Spec: aiv1alpha1.ExternalModelProviderSpec{
+			ProviderType:       aiv1alpha1.OpenAI,
+			BaseURL:            upstream.URL,
+			InsecureSkipVerify: true,
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-external", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "external-model",
+			Rules: []*aiv1alpha1.Rule{
+				{
+					TargetModels: []*aiv1alpha1.TargetModel{
+						{ExternalModelProviderName: "openai-provider"},
+					},
+				},
+			},
+		},
+	}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	reqBody := `{"model":"external-model","messages":[{"role":"user","content":"hello"}]}`
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(reqBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusTooManyRequests, w.Code)
+	assert.Contains(t, w.Body.String(), `"error":"rate limited"`)
+	assert.Empty(t, w.Header().Get("Connection"))
+	reason, ok := c.Get("finishReason")
+	assert.True(t, ok)
+	assert.Equal(t, "upstream_response", reason)
+}
+
+func TestRouter_HandlerFunc_ExternalProviderInvalidConfiguration(t *testing.T) {
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
+		ObjectMeta: v1.ObjectMeta{Name: "invalid-provider", Namespace: "default"},
+		Spec: aiv1alpha1.ExternalModelProviderSpec{
+			ProviderType: aiv1alpha1.OpenAI,
+			BaseURL:      "://invalid",
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-external", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "external-model",
+			Rules: []*aiv1alpha1.Rule{{
+				TargetModels: []*aiv1alpha1.TargetModel{{ExternalModelProviderName: "invalid-provider"}},
+			}},
+		},
+	}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"external-model","messages":[{"role":"user","content":"hello"}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	reason, ok := c.Get("finishReason")
+	assert.True(t, ok)
+	assert.Equal(t, "provider_config", reason)
+	assert.NotContains(t, w.Body.String(), "://invalid")
+}
+
+func TestRouter_HandlerFunc_ExternalProviderResponseForwardingFailure(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, `{"partial":true}`)
+	}))
+	defer upstream.Close()
+
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+	assert.NoError(t, store.AddOrUpdateExternalModelProvider(&aiv1alpha1.ExternalModelProvider{
+		ObjectMeta: v1.ObjectMeta{Name: "openai-provider", Namespace: "default"},
+		Spec: aiv1alpha1.ExternalModelProviderSpec{
+			ProviderType:       aiv1alpha1.OpenAI,
+			BaseURL:            upstream.URL,
+			InsecureSkipVerify: true,
+		},
+	}))
+	assert.NoError(t, store.AddOrUpdateModelRoute(&aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-external", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "external-model",
+			Rules: []*aiv1alpha1.Rule{{
+				TargetModels: []*aiv1alpha1.TargetModel{{ExternalModelProviderName: "openai-provider"}},
+			}},
+		},
+	}))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"external-model","messages":[{"role":"user","content":"hello"}]}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	router.HandlerFunc()(c)
+
+	reason, ok := c.Get("finishReason")
+	assert.True(t, ok)
+	assert.Equal(t, "response_forwarding", reason)
+}
+
+func TestProxyExternalRequest_AnthropicStreamAggregatesUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude\",\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n")
+		fmt.Fprint(w, "\n")
+		fmt.Fprint(w, "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":22}}\n")
+		fmt.Fprint(w, "\n")
+		fmt.Fprint(w, "data: {\"type\":\"message_stop\"}\n")
+		fmt.Fprint(w, "\n")
+	}))
+	defer upstream.Close()
+
+	w := &closeNotifyRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		closeCh:          make(chan bool),
+	}
+	c, _ := gin.CreateTestContext(w)
+	req, err := http.NewRequest(http.MethodPost, upstream.URL, nil)
+	assert.NoError(t, err)
+
+	adapter, err := providers.NewAdapter(aiv1alpha1.Anthropic)
+	assert.NoError(t, err)
+
+	var got providers.TokenUsage
+	err = proxyExternalRequest(c, req, adapter.ResponseParser(c, "/v1/messages"), false, true, "default/anthropic-provider", func(usage providers.TokenUsage) {
+		got = usage
+	})
+	assert.NoError(t, err)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"message_start"`)
+	assert.Equal(t, 11, got.PromptTokens)
+	assert.Equal(t, 22, got.CompletionTokens)
+	assert.Equal(t, 33, got.TotalTokens)
+}
+
+func TestProxyExternalRequest_OpenAIResponsesStreamAggregatesUsage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: response.created\n")
+		fmt.Fprint(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n")
+		fmt.Fprint(w, "\n")
+		fmt.Fprint(w, "event: response.completed\n")
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}}\n")
+		fmt.Fprint(w, "\n")
+	}))
+	defer upstream.Close()
+
+	for _, providerType := range []aiv1alpha1.ExternalProviderType{aiv1alpha1.OpenAI, ""} {
+		providerType := providerType
+		t.Run(fmt.Sprintf("provider type %q", providerType), func(t *testing.T) {
+			w := &closeNotifyRecorder{
+				ResponseRecorder: httptest.NewRecorder(),
+				closeCh:          make(chan bool),
+			}
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			upstreamRequest, err := http.NewRequest(http.MethodPost, upstream.URL, nil)
+			assert.NoError(t, err)
+			adapter, err := providers.NewAdapter(providerType)
+			assert.NoError(t, err)
+
+			var got providers.TokenUsage
+			callbackCount := 0
+			err = proxyExternalRequest(c, upstreamRequest, adapter.ResponseParser(c, "/v1/responses"), false, true, "default/openai-provider", func(usage providers.TokenUsage) {
+				got = usage
+				callbackCount++
+			})
+			assert.NoError(t, err)
+
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.Contains(t, w.Body.String(), "event: response.created")
+			assert.Contains(t, w.Body.String(), "event: response.completed")
+			assert.Contains(t, w.Body.String(), `"type":"response.completed"`)
+			assert.Equal(t, 1, callbackCount)
+			assert.Equal(t, 12, got.PromptTokens)
+			assert.Equal(t, 3, got.CompletionTokens)
+			assert.Equal(t, 15, got.TotalTokens)
+		})
+	}
+}
+
+func TestForwardResponseWithUsageParser_OpenAIUsageEventForwarding(t *testing.T) {
+	usageOnlyEvent := `data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`
+	usageWithChoiceEvent := `data: {"choices":[{"delta":{"content":"tail"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`
+	tests := []struct {
+		name             string
+		clientUsage      bool
+		usageEvent       string
+		wantUsageEvent   bool
+		wantFinishReason bool
+	}{
+		{
+			name:           "router injected usage-only event is omitted",
+			usageEvent:     usageOnlyEvent,
+			wantUsageEvent: false,
+		},
+		{
+			name:             "router injected usage with choices is forwarded",
+			usageEvent:       usageWithChoiceEvent,
+			wantUsageEvent:   true,
+			wantFinishReason: true,
+		},
+		{
+			name:           "client requested usage-only event is forwarded",
+			clientUsage:    true,
+			usageEvent:     usageOnlyEvent,
+			wantUsageEvent: true,
+		},
+	}
+
+	adapter := providers.DefaultAdapter()
+	provider := &aiv1alpha1.ExternalModelProvider{
+		Spec: aiv1alpha1.ExternalModelProviderSpec{BaseURL: "https://api.example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &closeNotifyRecorder{
+				ResponseRecorder: httptest.NewRecorder(),
+				closeCh:          make(chan bool),
+			}
+			c, _ := gin.CreateTestContext(w)
+			modelRequest := map[string]interface{}{"model": "test-model", "stream": true}
+			if tt.clientUsage {
+				modelRequest["stream_options"] = map[string]interface{}{"include_usage": true}
+			}
+			upstreamRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			_, err := adapter.BuildRequest(c, upstreamRequest, provider, nil, modelRequest)
+			if !assert.NoError(t, err) {
+				return
+			}
+			body := strings.Join([]string{
+				`data: {"choices":[{"delta":{"content":"hello"}}]}`,
+				"",
+				tt.usageEvent,
+				"",
+				"data: [DONE]",
+				"",
+			}, "\n")
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}
+
+			var got providers.TokenUsage
+			callbackCount := 0
+			err = forwardResponseWithUsageParser(c, resp, true, adapter.ResponseParser(c, "/v1/chat/completions"), func(usage providers.TokenUsage) {
+				got = usage
+				callbackCount++
+			})
+
+			assert.NoError(t, err)
+			assert.Contains(t, w.Body.String(), `"content":"hello"`)
+			assert.Contains(t, w.Body.String(), "data: [DONE]")
+			assert.Equal(t, tt.wantUsageEvent, strings.Contains(w.Body.String(), `"total_tokens":12`))
+			assert.Equal(t, tt.wantFinishReason, strings.Contains(w.Body.String(), `"finish_reason":"stop"`))
+			assert.Equal(t, tt.wantFinishReason, strings.Contains(w.Body.String(), `"content":"tail"`))
+			assert.Equal(t, 1, callbackCount)
+			assert.Equal(t, providers.TokenUsage{PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12}, got)
+		})
+	}
+}
+
+func TestCopyResponseHeadersPreservesMultipleValues(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	headers := http.Header{}
+	headers.Add("Set-Cookie", "session=first")
+	headers.Add("Set-Cookie", "preference=second")
+
+	copyResponseHeaders(c, headers, false)
+
+	assert.Equal(t, []string{"session=first", "preference=second"}, w.Header().Values("Set-Cookie"))
 }
 
 func TestRouter_HandlerFunc_DisaggregatedMode(t *testing.T) {
-	// 1. Setup backend mock
+	// 1. Setup backend mock server
 	prefillReqs := 0
 	decodeReqs := 0
 	backendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -267,7 +1613,7 @@ func TestRouter_HandlerFunc_DisaggregatedMode(t *testing.T) {
 			fmt.Fprint(w, `data: {"id":"decode-resp"}`)
 		}
 	})
-	router, store, backend := setupTestRouter(backendHandler)
+	router, store, backend := setupTestRouter(t, backendHandler)
 	defer backend.Close()
 
 	backendURL, _ := url.Parse(backend.URL)
@@ -348,7 +1694,7 @@ func TestRouter_HandlerFunc_DisaggregatedMode(t *testing.T) {
 }
 
 func TestRouter_HandlerFunc_ModelNotFound(t *testing.T) {
-	router, _, backend := setupTestRouter(nil)
+	router, _, backend := setupTestRouter(t, nil)
 	defer backend.Close()
 
 	w := httptest.NewRecorder()
@@ -364,12 +1710,409 @@ func TestRouter_HandlerFunc_ModelNotFound(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "route not found")
 }
 
+func countMetricsWithModelPrefix(t *testing.T, prefix string) int {
+	t.Helper()
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+
+	count := 0
+	for _, family := range families {
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == metrics.LabelModel && strings.HasPrefix(label.GetValue(), prefix) {
+					count++
+				}
+			}
+		}
+	}
+	return count
+}
+
+func requestCounterValue(t *testing.T, router *Router, model, path, statusCode, errorType string) float64 {
+	t.Helper()
+
+	metricsCh := make(chan prometheus.Metric)
+	go func() {
+		router.metrics.RequestsTotal.Collect(metricsCh)
+		close(metricsCh)
+	}()
+
+	var value float64
+	for collected := range metricsCh {
+		metric := &dto.Metric{}
+		if err := collected.Write(metric); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		labels := make(map[string]string, len(metric.Label))
+		for _, label := range metric.Label {
+			labels[label.GetName()] = label.GetValue()
+		}
+		if labels[metrics.LabelModel] == model &&
+			labels[metrics.LabelPath] == path &&
+			labels[metrics.LabelStatusCode] == statusCode &&
+			labels[metrics.LabelErrorType] == errorType {
+			value += metric.GetCounter().GetValue()
+		}
+	}
+	return value
+}
+
+func TestRequestFinishReason(t *testing.T) {
+	tests := []struct {
+		name           string
+		status         int
+		explicitReason string
+		expectedReason string
+	}{
+		{
+			name:           "successful response",
+			status:         http.StatusOK,
+			expectedReason: successfulRequestFinishReason,
+		},
+		{
+			name:           "unclassified error response",
+			status:         http.StatusServiceUnavailable,
+			expectedReason: failedRequestFinishReason,
+		},
+		{
+			name:           "explicit reason takes precedence",
+			status:         http.StatusServiceUnavailable,
+			explicitReason: "pod_discovery",
+			expectedReason: "pod_discovery",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Status(tt.status)
+			if tt.explicitReason != "" {
+				c.Set("finishReason", tt.explicitReason)
+			}
+
+			assert.Equal(t, tt.expectedReason, requestFinishReason(c))
+		})
+	}
+}
+
+func TestRouter_HandlerFunc_UnknownModelMetricsUseBoundedLabel(t *testing.T) {
+	router, _, backend := setupTestRouter(t, nil)
+	defer backend.Close()
+
+	prefix := "cardinality-proof-test-"
+	requestsBefore := requestCounterValue(t, router, metrics.UnknownModel, "/v1/chat/completions", "404", "route_not_found")
+
+	for i := 0; i < 3; i++ {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		reqBody := fmt.Sprintf(`{"model":"%s%d","prompt":"hello"}`, prefix, i)
+		c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+		c.Request.Header.Set("Content-Type", "application/json")
+
+		router.HandlerFunc()(c)
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+		assert.Contains(t, w.Body.String(), "route not found")
+	}
+
+	assert.Equal(t, 0, countMetricsWithModelPrefix(t, prefix))
+	assert.Equal(t, float64(3), requestCounterValue(t, router, metrics.UnknownModel, "/v1/chat/completions", "404", "route_not_found")-requestsBefore)
+}
+
+func TestRouter_HandlerFunc_BackendUnavailable(t *testing.T) {
+	tests := []struct {
+		name             string
+		addModelServer   bool
+		addPod           bool
+		expectedStatus   int
+		expectedResponse string
+		expectedReason   string
+	}{
+		{
+			name:             "missing model server remains not found",
+			expectedStatus:   http.StatusNotFound,
+			expectedResponse: "can't find model server",
+			expectedReason:   "pod_discovery",
+		},
+		{
+			name:             "model server without pods is unavailable",
+			addModelServer:   true,
+			expectedStatus:   http.StatusServiceUnavailable,
+			expectedResponse: "no available pods for model server",
+			expectedReason:   "pod_discovery",
+		},
+		{
+			name:             "all backend requests fail",
+			addModelServer:   true,
+			addPod:           true,
+			expectedStatus:   http.StatusServiceUnavailable,
+			expectedResponse: "request to all pods failed",
+			expectedReason:   "proxy",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backendHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			})
+			router, store, backend := setupTestRouter(t, backendHandler)
+			defer backend.Close()
+
+			backendURL, err := url.Parse(backend.URL)
+			assert.NoError(t, err)
+			backendPort, err := strconv.Atoi(backendURL.Port())
+			assert.NoError(t, err)
+
+			modelServer := &aiv1alpha1.ModelServer{
+				ObjectMeta: v1.ObjectMeta{Name: "ms-unavailable", Namespace: "default"},
+				Spec: aiv1alpha1.ModelServerSpec{
+					Model:        func(s string) *string { return &s }("base-model"),
+					WorkloadPort: aiv1alpha1.WorkloadPort{Port: int32(backendPort)},
+				},
+			}
+			modelRoute := &aiv1alpha1.ModelRoute{
+				ObjectMeta: v1.ObjectMeta{Name: "mr-unavailable", Namespace: "default"},
+				Spec: aiv1alpha1.ModelRouteSpec{
+					ModelName: "unavailable-model",
+					Rules: []*aiv1alpha1.Rule{
+						{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: modelServer.Name}}},
+					},
+				},
+			}
+
+			if tt.addModelServer {
+				podNames := sets.New[types.NamespacedName]()
+				var pod *corev1.Pod
+				if tt.addPod {
+					podName := types.NamespacedName{Name: "pod-unavailable", Namespace: "default"}
+					podNames.Insert(podName)
+					pod = &corev1.Pod{
+						ObjectMeta: v1.ObjectMeta{Name: podName.Name, Namespace: podName.Namespace},
+						Status:     corev1.PodStatus{PodIP: backendURL.Hostname(), Phase: corev1.PodRunning},
+					}
+				}
+				store.AddOrUpdateModelServer(modelServer, podNames)
+				if pod != nil {
+					store.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{modelServer})
+				}
+			}
+			store.AddOrUpdateModelRoute(modelRoute)
+
+			requestsBefore := requestCounterValue(
+				t, router, "unavailable-model", "/v1/chat/completions",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			requestBody := `{"model":"unavailable-model","prompt":"hello"}`
+			c.Request, err = http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(requestBody))
+			assert.NoError(t, err)
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			router.HandlerFunc()(c)
+
+			assert.Equal(t, tt.expectedStatus, w.Code)
+			assert.Contains(t, w.Body.String(), tt.expectedResponse)
+			assert.Equal(t, float64(1), requestCounterValue(
+				t, router, "unavailable-model", "/v1/chat/completions",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)-requestsBefore)
+		})
+	}
+}
+
+func TestRouter_HandlerFunc_InferencePoolPodDiscovery(t *testing.T) {
+	tests := []struct {
+		name             string
+		matchLabels      map[inferencev1.LabelKey]inferencev1.LabelValue
+		deleteDuringRead bool
+		expectedStatus   int
+		expectedResponse string
+		expectedReason   string
+	}{
+		{
+			name: "no matching pods is unavailable",
+			matchLabels: map[inferencev1.LabelKey]inferencev1.LabelValue{
+				"app": "missing",
+			},
+			expectedStatus:   http.StatusServiceUnavailable,
+			expectedResponse: "no available pods for inference pool",
+			expectedReason:   "pod_discovery",
+		},
+		{
+			name: "invalid selector is an internal error",
+			matchLabels: map[inferencev1.LabelKey]inferencev1.LabelValue{
+				"invalid key": "value",
+			},
+			expectedStatus:   http.StatusInternalServerError,
+			expectedResponse: "failed to get pods for inference pool",
+			expectedReason:   "pod_discovery",
+		},
+		{
+			name:             "pool deleted during pod lookup is not found",
+			deleteDuringRead: true,
+			expectedStatus:   http.StatusNotFound,
+			expectedResponse: "can't find inference pool",
+			expectedReason:   "inference_pool_discovery",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router, store, backend := setupTestRouter(t, nil)
+			defer backend.Close()
+
+			pathType := gatewayv1.PathMatchPathPrefix
+			pathValue := "/"
+			gatewayKind := gatewayv1.Kind("Gateway")
+			poolGroup := inferencePoolBackendGroup
+			poolKind := inferencePoolBackendKind
+			httpRoute := &gatewayv1.HTTPRoute{
+				ObjectMeta: v1.ObjectMeta{Name: "route-unavailable", Namespace: "default"},
+				Spec: gatewayv1.HTTPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{
+						ParentRefs: []gatewayv1.ParentReference{{Name: "gw", Kind: &gatewayKind}},
+					},
+					Rules: []gatewayv1.HTTPRouteRule{{
+						Matches: []gatewayv1.HTTPRouteMatch{{
+							Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: &pathValue},
+						}},
+						BackendRefs: []gatewayv1.HTTPBackendRef{{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &poolGroup,
+									Kind:  &poolKind,
+									Name:  "pool-unavailable",
+								},
+							},
+						}},
+					}},
+				},
+			}
+			inferencePool := &inferencev1.InferencePool{
+				ObjectMeta: v1.ObjectMeta{Name: "pool-unavailable", Namespace: "default"},
+				Spec: inferencev1.InferencePoolSpec{
+					Selector: inferencev1.LabelSelector{MatchLabels: tt.matchLabels},
+				},
+			}
+			assert.NoError(t, store.AddOrUpdateHTTPRoute(httpRoute))
+			assert.NoError(t, store.AddOrUpdateInferencePool(inferencePool))
+			if tt.deleteDuringRead {
+				router.store = &inferencePoolDeletedStore{
+					Store:         store,
+					inferencePool: inferencePool,
+				}
+			}
+
+			requestsBefore := requestCounterValue(
+				t, router, metrics.UnknownModel, "/custom",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Set(GatewayKey, "default/gw")
+			requestBody := `{"model":"inference-model","prompt":"hello"}`
+			var err error
+			c.Request, err = http.NewRequest(http.MethodPost, "/custom", bytes.NewBufferString(requestBody))
+			assert.NoError(t, err)
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			router.HandlerFunc()(c)
+
+			assert.Equal(t, tt.expectedStatus, w.Code)
+			assert.Contains(t, w.Body.String(), tt.expectedResponse)
+			assert.Equal(t, float64(1), requestCounterValue(
+				t, router, metrics.UnknownModel, "/custom",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)-requestsBefore)
+		})
+	}
+}
+
+func TestRouter_HandlerFunc_AllZeroHTTPRouteBackendWeights(t *testing.T) {
+	router, store, backend := setupTestRouter(t, nil)
+	defer backend.Close()
+
+	pathType := gatewayv1.PathMatchPathPrefix
+	pathValue := "/"
+	gatewayKind := gatewayv1.Kind("Gateway")
+	poolGroup := inferencePoolBackendGroup
+	poolKind := inferencePoolBackendKind
+	zero := int32(0)
+	httpRoute := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "route-all-zero", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Name: "gw", Kind: &gatewayKind}},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{{
+				Matches: []gatewayv1.HTTPRouteMatch{{
+					Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: &pathValue},
+				}},
+				BackendRefs: []gatewayv1.HTTPBackendRef{{
+					BackendRef: gatewayv1.BackendRef{
+						BackendObjectReference: gatewayv1.BackendObjectReference{
+							Group: &poolGroup,
+							Kind:  &poolKind,
+							Name:  "pool-zero",
+						},
+						Weight: &zero,
+					},
+				}},
+			}},
+		},
+	}
+	assert.NoError(t, store.AddOrUpdateHTTPRoute(httpRoute))
+
+	requestsBefore := requestCounterValue(
+		t, router, metrics.UnknownModel, "/custom", "503", "inference_pool_selection",
+	)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set(GatewayKey, "default/gw")
+	var err error
+	c.Request, err = http.NewRequest(http.MethodPost, "/custom", bytes.NewBufferString(`{"model":"inference-model","prompt":"hello"}`))
+	assert.NoError(t, err)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Contains(t, w.Body.String(), "matched HTTPRoute default/route-all-zero has no eligible InferencePool backend")
+	assert.NotContains(t, w.Body.String(), "route not found")
+	assert.Equal(t, float64(1), requestCounterValue(
+		t, router, metrics.UnknownModel, "/custom", "503", "inference_pool_selection",
+	)-requestsBefore)
+}
+
+func TestRouter_GetPodsAndServer_ModelServerDeletedDuringPodLookup(t *testing.T) {
+	modelServerName := types.NamespacedName{Name: "deleted", Namespace: "default"}
+	modelServer := &aiv1alpha1.ModelServer{
+		ObjectMeta: v1.ObjectMeta{Name: modelServerName.Name, Namespace: modelServerName.Namespace},
+	}
+	router := &Router{store: &modelServerDeletedStore{
+		Store:       datastore.New(),
+		modelServer: modelServer,
+	}}
+
+	pods, foundModelServer, err := router.getPodsAndServer(modelServerName)
+
+	assert.Error(t, err)
+	assert.Nil(t, pods)
+	assert.Nil(t, foundModelServer)
+}
+
 func TestRouter_HandlerFunc_ScheduleFailure(t *testing.T) {
 	backendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// This should not be called
 		t.Error("backend should not be called on schedule failure")
 	})
-	router, store, backend := setupTestRouter(backendHandler)
+	router, store, backend := setupTestRouter(t, backendHandler)
 	defer backend.Close()
 
 	backendURL, _ := url.Parse(backend.URL)
@@ -424,6 +2167,111 @@ func TestRouter_HandlerFunc_ScheduleFailure(t *testing.T) {
 	// 5. Assertions
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, w.Body.String(), "can't schedule to target pod")
+}
+
+func TestParseModelRequestValidatesModelName(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{
+			name:    "valid model",
+			body:    `{"model": "test-model", "prompt": "hello"}`,
+			wantErr: false,
+		},
+		{
+			name:    "missing model",
+			body:    `{"prompt": "hello"}`,
+			wantErr: true,
+		},
+		{
+			name:    "non-string model",
+			body:    `{"model": 123, "prompt": "hello"}`,
+			wantErr: true,
+		},
+		{
+			name:    "empty model",
+			body:    `{"model": "", "prompt": "hello"}`,
+			wantErr: true,
+		},
+		{
+			name:    "whitespace model",
+			body:    `{"model": "  ", "prompt": "hello"}`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(tt.body))
+
+			got, err := ParseModelRequest(c)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, got)
+				assert.Equal(t, http.StatusNotFound, w.Code)
+				assert.Contains(t, w.Body.String(), "model not found")
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, "test-model", got["model"])
+		})
+	}
+}
+
+func TestParseModelRequestReturnsReadableJSONError(t *testing.T) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":`))
+
+	modelRequest, err := ParseModelRequest(c)
+
+	assert.Error(t, err)
+	assert.Nil(t, modelRequest)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "unexpected EOF")
+}
+
+func TestParseModelRequestAllowsOnlyOneJSONValue(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantErr    bool
+		wantStatus int
+	}{
+		{
+			name: "trailing whitespace",
+			body: "{\"model\":\"test-model\"} \n\t",
+		},
+		{
+			name:       "second JSON value",
+			body:       `{"model":"test-model"}{"extra":true}`,
+			wantErr:    true,
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(tt.body))
+
+			modelRequest, err := ParseModelRequest(c)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, modelRequest)
+				assert.Equal(t, tt.wantStatus, w.Code)
+				assert.Contains(t, w.Body.String(), "invalid request body")
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, "test-model", modelRequest["model"])
+		})
+	}
 }
 
 func TestAccessLogConfigurationFromEnv(t *testing.T) {
@@ -563,6 +2411,202 @@ func TestAccessLogConfigurationFromEnv(t *testing.T) {
 	}
 }
 
+// TestProxy_RetryBodyNotDrained verifies that when the first pod returns a non-2xx
+// response, the retry attempt to the next pod carries the full request body.
+// Before the fix, transport.RoundTrip drained the body on the first attempt, so
+// every subsequent pod received an empty POST body.
+func TestProxy_RetryBodyNotDrained(t *testing.T) {
+	var receivedBodies []string
+
+	// Single backend: returns 503 on the first call, 200 on the second.
+	// Both pods in the test point to this same server so we can observe both attempts.
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "")
+			return
+		}
+		if r.URL.Path == "/v1/models" {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		receivedBodies = append(receivedBodies, string(body))
+		if len(receivedBodies) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"retry-ok"}`)
+	}))
+	defer backend.Close()
+
+	backendURL, _ := url.Parse(backend.URL)
+	backendIP := backendURL.Hostname()
+	backendPort, _ := strconv.Atoi(backendURL.Port())
+
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+
+	modelServer := &aiv1alpha1.ModelServer{
+		ObjectMeta: v1.ObjectMeta{Name: "ms-retry", Namespace: "default"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			Model:           func(s string) *string { return &s }("base-model"),
+			WorkloadPort:    aiv1alpha1.WorkloadPort{Port: int32(backendPort)},
+			InferenceEngine: "vLLM",
+		},
+	}
+	pod1 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-retry-1", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: backendIP, Phase: corev1.PodRunning},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-retry-2", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: backendIP, Phase: corev1.PodRunning},
+	}
+	modelRoute := &aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-retry", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "retry-model",
+			Rules: []*aiv1alpha1.Rule{
+				{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms-retry"}}},
+			},
+		},
+	}
+
+	store.AddOrUpdateModelServer(modelServer, sets.New(
+		types.NamespacedName{Name: "pod-retry-1", Namespace: "default"},
+		types.NamespacedName{Name: "pod-retry-2", Namespace: "default"},
+	))
+	store.AddOrUpdatePod(pod1, []*aiv1alpha1.ModelServer{modelServer})
+	store.AddOrUpdatePod(pod2, []*aiv1alpha1.ModelServer{modelServer})
+	store.AddOrUpdateModelRoute(modelRoute)
+
+	// Give pod-2 a non-zero waiting count so pod-1 scores higher and is always
+	// BestPods[0]. This guarantees the 503 is hit first, forcing a retry to pod-2.
+	podInfo2 := store.GetPodInfo(types.NamespacedName{Name: "pod-retry-2", Namespace: "default"})
+	assert.NotNil(t, podInfo2)
+	podInfo2.RequestWaitingNum = 1
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	reqBody := `{"model": "retry-model", "prompt": "test prompt for retry path"}`
+	c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+	accessCtx := accesslog.NewAccessLogContext("retry-request", http.MethodPost, c.Request.URL.Path, c.Request.Proto, "retry-model")
+	c.Set(accesslog.AccessLogContextKey, accessCtx)
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	if assert.Len(t, receivedBodies, 2, "expected exactly 2 backend attempts (first 503, then retry)") {
+		// The router rewrites model name to the ModelServer's base model before dispatch,
+		// so check for the prompt which passes through unchanged.
+		assert.Contains(t, receivedBodies[0], "test prompt for retry path", "first attempt body was missing")
+		// Regression assertion: before the fix, transport.RoundTrip drained the body on the
+		// first attempt, so this would be an empty string.
+		assert.Contains(t, receivedBodies[1], "test prompt for retry path", "retry attempt sent empty body (body reuse regression)")
+	}
+	assert.Equal(t, metrics.BackendTypeModelServer, accessCtx.BackendType)
+	assert.Equal(t, "default/ms-retry", accessCtx.BackendName)
+	assert.Equal(t, "base-model", accessCtx.UpstreamModel)
+	assert.Equal(t, 2, accessCtx.UpstreamAttempts)
+	assert.Equal(t, http.StatusOK, accessCtx.UpstreamStatusCode)
+}
+
+func TestRouter_HandlerFunc_ListModels(t *testing.T) {
+	router, store, backend := setupTestRouter(t, nil)
+	defer backend.Close()
+
+	backendURL, _ := url.Parse(backend.URL)
+	backendIP := backendURL.Hostname()
+	backendPort, _ := strconv.Atoi(backendURL.Port())
+
+	modelServer := &aiv1alpha1.ModelServer{
+		ObjectMeta: v1.ObjectMeta{Name: "ms-1", Namespace: "default"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			Model:        func(s string) *string { return &s }("base-model"),
+			WorkloadPort: aiv1alpha1.WorkloadPort{Port: int32(backendPort)},
+		},
+	}
+	pod1 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-1", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: backendIP, Phase: corev1.PodRunning},
+	}
+	modelRoute1 := &aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-1", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "model-alpha",
+			Rules: []*aiv1alpha1.Rule{
+				{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms-1"}}},
+			},
+		},
+	}
+	modelRoute2 := &aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-2", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "model-beta",
+			Rules: []*aiv1alpha1.Rule{
+				{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms-1"}}},
+			},
+		},
+	}
+
+	store.AddOrUpdateModelServer(modelServer, sets.New(types.NamespacedName{Name: "pod-1", Namespace: "default"}))
+	store.AddOrUpdatePod(pod1, []*aiv1alpha1.ModelServer{modelServer})
+	store.AddOrUpdateModelRoute(modelRoute1)
+	store.AddOrUpdateModelRoute(modelRoute2)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest("GET", "/v1/models", nil)
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.NoError(t, err)
+	assert.Equal(t, "list", resp.Object)
+	assert.Len(t, resp.Data, 2)
+	assert.Equal(t, "model-alpha", resp.Data[0].ID)
+	assert.Equal(t, "model-beta", resp.Data[1].ID)
+	assert.Equal(t, "model", resp.Data[0].Object)
+	assert.Equal(t, "kthena", resp.Data[0].OwnedBy)
+}
+
+func TestRouter_HandlerFunc_ListModels_Empty(t *testing.T) {
+	router, _, backend := setupTestRouter(t, nil)
+	defer backend.Close()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest("GET", "/v1/models", nil)
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp struct {
+		Object string        `json:"object"`
+		Data   []interface{} `json:"data"`
+	}
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.NoError(t, err)
+	assert.Equal(t, "list", resp.Object)
+	assert.Empty(t, resp.Data)
+}
+
 // Helper function to parse boolean (same logic as strconv.ParseBool but simpler for test)
 func parseBool(str string) (bool, error) {
 	switch str {
@@ -572,4 +2616,582 @@ func parseBool(str string) (bool, error) {
 		return false, nil
 	}
 	return false, &strconv.NumError{Func: "ParseBool", Num: str, Err: strconv.ErrSyntax}
+}
+
+// setupFairnessTestRouter creates a Router wired to a real datastore and a mock
+// HTTP backend.  It populates the store with a ModelServer, Pod, and ModelRoute
+// so that doLoadbalance can find a target pod whose IP/port matches the mock
+// backend.
+func setupFairnessTestRouter(t *testing.T, backendHandler http.Handler) (*Router, datastore.Store, *httptest.Server) {
+	t.Helper()
+	router, store, backend := setupTestRouter(t, backendHandler)
+
+	backendURL, _ := url.Parse(backend.URL)
+	backendIP := backendURL.Hostname()
+	backendPort, _ := strconv.Atoi(backendURL.Port())
+
+	modelServer := &aiv1alpha1.ModelServer{
+		ObjectMeta: v1.ObjectMeta{Name: "ms-fair", Namespace: "default"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			Model:           func(s string) *string { return &s }("fair-model-base"),
+			WorkloadPort:    aiv1alpha1.WorkloadPort{Port: int32(backendPort)},
+			InferenceEngine: "vLLM",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-fair", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: backendIP, Phase: corev1.PodRunning},
+	}
+	modelRoute := &aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-fair", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "fair-model",
+			Rules: []*aiv1alpha1.Rule{
+				{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms-fair"}}},
+			},
+		},
+	}
+
+	store.AddOrUpdateModelServer(modelServer, sets.New(types.NamespacedName{Name: "pod-fair", Namespace: "default"}))
+	store.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{modelServer})
+	store.AddOrUpdateModelRoute(modelRoute)
+
+	return router, store, backend
+}
+
+func TestHandleFairnessScheduling(t *testing.T) {
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"fair-ok"}`)
+	})
+
+	tests := []struct {
+		name            string
+		backendHandler  http.Handler
+		fairnessTimeout time.Duration
+		setUserID       bool
+		// storeWrapper replaces the router's store before calling handleFairnessScheduling.
+		// nil means use the real store (request will be dispatched by the QPS ticker).
+		storeWrapper func(real datastore.Store) datastore.Store
+		// cancelAfter, when >0, cancels the request context after this duration
+		// to simulate a client disconnect.
+		cancelAfter      time.Duration
+		wantErr          bool
+		wantErrMsg       string
+		wantHTTPStatus   int
+		wantBodyContains string
+		// Session-boost queue-wait timeout configuration for the test case.
+		enableSessionBoost  bool
+		sessionBoostTimeout time.Duration
+	}{
+		{
+			name:             "happy path with userId",
+			backendHandler:   okHandler,
+			fairnessTimeout:  5 * time.Second,
+			setUserID:        true,
+			wantErr:          false,
+			wantHTTPStatus:   http.StatusOK,
+			wantBodyContains: `"id":"fair-ok"`,
+		},
+		{
+			name:             "happy path without userId",
+			backendHandler:   okHandler,
+			fairnessTimeout:  5 * time.Second,
+			setUserID:        false,
+			wantErr:          false,
+			wantHTTPStatus:   http.StatusOK,
+			wantBodyContains: `"id":"fair-ok"`,
+		},
+		{
+			name:            "timeout when queue never dispatches",
+			fairnessTimeout: 50 * time.Millisecond,
+			setUserID:       true,
+			storeWrapper:    func(real datastore.Store) datastore.Store { return &blockingEnqueueStore{Store: real} },
+			wantErr:         true,
+			wantErrMsg:      "timed out",
+			wantHTTPStatus:  http.StatusGatewayTimeout,
+		},
+		{
+			name:            "client disconnect before dispatch",
+			fairnessTimeout: 10 * time.Second,
+			setUserID:       true,
+			storeWrapper:    func(real datastore.Store) datastore.Store { return &blockingEnqueueStore{Store: real} },
+			cancelAfter:     50 * time.Millisecond,
+			wantErr:         true,
+			wantErrMsg:      "client disconnected",
+			wantHTTPStatus:  http.StatusServiceUnavailable,
+		},
+		{
+			name:            "enqueue failure",
+			fairnessTimeout: 5 * time.Second,
+			setUserID:       true,
+			storeWrapper:    func(real datastore.Store) datastore.Store { return &failingEnqueueStore{Store: real} },
+			wantErr:         true,
+			wantErrMsg:      "failed to enqueue request",
+			wantHTTPStatus:  http.StatusInternalServerError,
+		},
+		{
+			name:                "session boost queue-wait timeout returns 504",
+			fairnessTimeout:     10 * time.Second,
+			setUserID:           true,
+			storeWrapper:        func(real datastore.Store) datastore.Store { return &blockingEnqueueStore{Store: real} },
+			enableSessionBoost:  true,
+			sessionBoostTimeout: 50 * time.Millisecond,
+			wantErr:             true,
+			wantErrMsg:          "timed out",
+			wantHTTPStatus:      http.StatusGatewayTimeout,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router, store, backend := setupFairnessTestRouter(t, tt.backendHandler)
+			defer backend.Close()
+
+			router.queueTimeout = tt.fairnessTimeout
+			router.sessionBoostTimeout = tt.sessionBoostTimeout
+			// Set the package-level flag explicitly for every case (and restore it)
+			// so subtests stay isolated regardless of execution order.
+			prevEnableSessionBoost := EnableSessionBoost
+			EnableSessionBoost = tt.enableSessionBoost
+			defer func() { EnableSessionBoost = prevEnableSessionBoost }()
+			if tt.storeWrapper != nil {
+				router.store = tt.storeWrapper(store)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			router.store.Run(ctx)
+			defer cancel()
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			reqBody := `{"model":"fair-model","prompt":"hello fairness"}`
+
+			var clientCancel context.CancelFunc
+			if tt.cancelAfter > 0 {
+				var ctx context.Context
+				ctx, clientCancel = context.WithCancel(context.Background())
+				c.Request, _ = http.NewRequestWithContext(ctx, "POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+			} else {
+				c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+			}
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			modelRequest, err := ParseModelRequest(c)
+			assert.NoError(t, err)
+			prompt, perr := utils.ParsePrompt(modelRequest)
+			assert.NoError(t, perr)
+			c.Set(PromptKey, prompt)
+			if tt.setUserID {
+				c.Set(common.UserIdKey, "user-test")
+			}
+			c.Set("metricsRecorder", metrics.NewRequestMetricsRecorder(router.metrics, "fair-model", "/v1/chat/completions"))
+
+			// Run handleFairnessScheduling asynchronously so we can trigger
+			// client cancellation mid-flight when needed.
+			done := make(chan error, 1)
+			go func() {
+				done <- router.handleFairnessScheduling(c, modelRequest, "req-test", "fair-model")
+			}()
+
+			if clientCancel != nil {
+				time.Sleep(tt.cancelAfter)
+				clientCancel()
+			}
+
+			err = <-done
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrMsg)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantHTTPStatus, w.Code)
+			if tt.wantBodyContains != "" {
+				assert.Contains(t, w.Body.String(), tt.wantBodyContains)
+			}
+		})
+	}
+}
+
+// --- Test helper: store wrapper that accepts Enqueue but never notifies ---
+
+// blockingEnqueueStore wraps a real Store but overrides Enqueue so the
+// request is accepted (no error) but never dispatched (NotifyChan is never closed).
+type blockingEnqueueStore struct {
+	datastore.Store
+}
+
+func (s *blockingEnqueueStore) Enqueue(req *datastore.Request) error {
+	// Accept the request but never signal NotifyChan — simulates a full queue.
+	return nil
+}
+
+// failingEnqueueStore wraps a real Store and always returns an error on Enqueue.
+type failingEnqueueStore struct {
+	datastore.Store
+}
+
+func (s *failingEnqueueStore) Enqueue(req *datastore.Request) error {
+	return fmt.Errorf("injected enqueue failure")
+}
+
+func TestUpstreamTimeoutFor(t *testing.T) {
+	tests := []struct {
+		name   string
+		server *aiv1alpha1.ModelServer
+		want   time.Duration
+	}{
+		{
+			name:   "nil model server",
+			server: nil,
+			want:   0,
+		},
+		{
+			name:   "no traffic policy",
+			server: &aiv1alpha1.ModelServer{},
+			want:   0,
+		},
+		{
+			name: "traffic policy without timeout",
+			server: &aiv1alpha1.ModelServer{
+				Spec: aiv1alpha1.ModelServerSpec{TrafficPolicy: &aiv1alpha1.TrafficPolicy{}},
+			},
+			want: 0,
+		},
+		{
+			name: "timeout configured",
+			server: &aiv1alpha1.ModelServer{
+				Spec: aiv1alpha1.ModelServerSpec{
+					TrafficPolicy: &aiv1alpha1.TrafficPolicy{
+						Timeout: &v1.Duration{Duration: 2 * time.Second},
+					},
+				},
+			},
+			want: 2 * time.Second,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, upstreamTimeoutFor(tt.server))
+		})
+	}
+}
+
+// enqueueSpyStore wraps a real Store and records whether Enqueue was invoked.
+// Enqueue is the sole place that creates a model-specific waiting queue and its
+// dequeue goroutine (on first use for a given model name), so asserting it was
+// never called is proof that no queue/goroutine was created for that request.
+type enqueueSpyStore struct {
+	datastore.Store
+	enqueued atomic.Bool
+}
+
+func (s *enqueueSpyStore) Enqueue(req *datastore.Request) error {
+	s.enqueued.Store(true)
+	return s.Store.Enqueue(req)
+}
+
+// A backend that accepts the connection but never completes it must fail at the
+// configured timeout, which ResponseHeaderTimeout alone would not have bounded.
+func TestDoRequestBoundsConnectionSetup(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(t, err)
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+
+	host, portStr, err := net.SplitHostPort(listener.Addr().String())
+	assert.NoError(t, err)
+	port, err := strconv.Atoi(portStr)
+	assert.NoError(t, err)
+
+	req, err := http.NewRequest(http.MethodPost, "https://placeholder/v1/chat/completions", strings.NewReader("{}"))
+	assert.NoError(t, err)
+
+	start := time.Now()
+	_, err = doRequest(req, host, int32(port), 200*time.Millisecond)
+	elapsed := time.Since(start)
+
+	assert.Error(t, err)
+	assert.Less(t, elapsed, 2*time.Second, "TLS handshake to a silent listener must be bounded by the policy")
+}
+
+// A backend that never sends response headers must fail at the configured timeout
+func TestDoRequestHonorsTimeout(t *testing.T) {
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer func() {
+		close(release)
+		backend.Close()
+	}()
+
+	host, port := splitHostPort(t, backend.URL)
+
+	req, err := http.NewRequest(http.MethodPost, backend.URL+"/v1/chat/completions", strings.NewReader("{}"))
+	assert.NoError(t, err)
+
+	start := time.Now()
+	_, err = doRequest(req, host, port, 300*time.Millisecond)
+	elapsed := time.Since(start)
+
+	assert.Error(t, err, "a stalled backend should fail once the timeout elapses")
+	assert.Less(t, elapsed, 3*time.Second, "should fail near the timeout, not hang")
+	assert.GreaterOrEqual(t, elapsed, 250*time.Millisecond, "should not fail before the timeout")
+}
+
+// With no timeout configured the request is bounded only by its context
+func TestDoRequestWithoutTimeoutStillWaits(t *testing.T) {
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	host, port := splitHostPort(t, backend.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, backend.URL+"/v1/chat/completions", strings.NewReader("{}"))
+	assert.NoError(t, err)
+
+	_, err = doRequest(req, host, port, 0)
+	assert.Error(t, err, "without a policy timeout only the request context bounds the call")
+	close(release)
+}
+
+func splitHostPort(t *testing.T, rawURL string) (string, int32) {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	assert.NoError(t, err)
+	host, portStr, err := net.SplitHostPort(u.Host)
+	assert.NoError(t, err)
+	p, err := strconv.Atoi(portStr)
+	assert.NoError(t, err)
+	return host, int32(p)
+}
+
+// A stream slower than the timeout must not be cut off, only headers are bounded
+func TestDoRequestTimeoutDoesNotTruncateSlowStream(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		assert.True(t, ok)
+		flusher.Flush()
+		for i := 0; i < 6; i++ {
+			time.Sleep(100 * time.Millisecond)
+			fmt.Fprintf(w, "data: chunk-%d\n\n", i)
+			flusher.Flush()
+		}
+	}))
+	defer backend.Close()
+
+	host, port := splitHostPort(t, backend.URL)
+	req, err := http.NewRequest(http.MethodPost, backend.URL+"/v1/chat/completions", strings.NewReader("{}"))
+	assert.NoError(t, err)
+
+	// Body takes ~600ms, well past the 200ms header timeout
+	resp, err := doRequest(req, host, port, 200*time.Millisecond)
+	assert.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err, "a slow stream must not be cut off by the header timeout")
+	assert.Contains(t, string(body), "chunk-5", "the whole stream should arrive")
+}
+
+// TestRouter_HandlerFunc_UnknownModel_RejectsBeforeQueueing is an
+// integration-style check that a request for a model with no registered
+// ModelRoute is rejected by the shared validation in HandlerFunc, before the
+// router chooses between the queued (fairness/session-boost) and direct
+// load-balancing paths. It covers all three configurations (fairness
+// scheduling, session boost, and neither) and asserts observability
+// end-to-end: unknown-model requests must be labeled "route_not_found", not
+// "scheduling", regardless of which path they would have taken. For the
+// queued paths it also proves store.Enqueue is never reached, since Enqueue
+// unconditionally creates a per-model queue and goroutine keyed by the
+// (client-supplied) model name, and that queue is never cleaned up because
+// cleanup is tied to the ModelRoute lifecycle.
+func TestRouter_HandlerFunc_UnknownModel_RejectsBeforeQueueing(t *testing.T) {
+	tests := []struct {
+		name                     string
+		enableFairnessScheduling bool
+		enableSessionBoost       bool
+	}{
+		{name: "fairness scheduling enabled", enableFairnessScheduling: true},
+		{name: "session boost enabled", enableSessionBoost: true},
+		{name: "neither scheduling mode enabled"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router, store, backend := setupTestRouter(t, nil)
+			defer backend.Close()
+
+			prevEnableFairnessScheduling := EnableFairnessScheduling
+			prevEnableSessionBoost := EnableSessionBoost
+			EnableFairnessScheduling = tt.enableFairnessScheduling
+			EnableSessionBoost = tt.enableSessionBoost
+			defer func() {
+				EnableFairnessScheduling = prevEnableFairnessScheduling
+				EnableSessionBoost = prevEnableSessionBoost
+			}()
+
+			spy := &enqueueSpyStore{Store: store}
+			router.store = spy
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			reqBody := `{"model":"never-registered-model","prompt":"hello"}`
+			c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			router.HandlerFunc()(c)
+
+			assert.Equal(t, http.StatusNotFound, w.Code)
+			assert.Contains(t, w.Body.String(), "route not found")
+
+			reason, ok := c.Get("finishReason")
+			assert.True(t, ok)
+			assert.Equal(t, "route_not_found", reason, "unknown model must be labeled route_not_found, not scheduling")
+
+			assert.False(t, spy.enqueued.Load(), "unknown model must be rejected before reaching Enqueue")
+			for _, stat := range store.GetRequestWaitingQueueStats() {
+				assert.NotEqual(t, "never-registered-model", stat.Model, "no queue should be created for an unregistered model")
+			}
+		})
+	}
+}
+
+type mockKVConnector struct {
+	calls        atomic.Int32
+	proxyHandler func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error)
+}
+
+func (m *mockKVConnector) Name() string {
+	return "mock"
+}
+
+func (m *mockKVConnector) Proxy(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+	m.calls.Add(1)
+	if m.proxyHandler != nil {
+		return m.proxyHandler(c, reqBody, prefillAddr, decodeAddr, hooks)
+	}
+	return 0, nil
+}
+
+func TestRouter_ProxyToPDDisaggregated_RetryBehavior(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	pod1 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-1", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.1"},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-2", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.2"},
+	}
+	info1 := &datastore.PodInfo{Pod: pod1}
+	info2 := &datastore.PodInfo{Pod: pod2}
+
+	tests := []struct {
+		name            string
+		proxyHandler    func(connector *mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error)
+		wantErr         bool
+		wantErrContains string
+		wantCalls       int32
+		wantStatus      int
+		callsMsg        string
+	}{
+		{
+			name: "does not retry when response written",
+			proxyHandler: func(*mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+				return func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+					// Simulate response headers / chunks being written before error occurs
+					c.Writer.WriteHeader(http.StatusOK)
+					_, _ = c.Writer.Write([]byte("data: partial response\n\n"))
+					return 5, fmt.Errorf("decode connection reset mid-stream")
+				}
+			},
+			wantErr:         true,
+			wantErrContains: "decode connection reset mid-stream",
+			wantCalls:       1,
+			wantStatus:      http.StatusOK,
+			callsMsg:        "must not retry to second pod pair when response was already written to client",
+		},
+		{
+			name: "retries when response not written",
+			proxyHandler: func(connector *mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+				return func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+					if connector.calls.Load() == 1 {
+						// First attempt fails without writing any headers/body
+						return 0, fmt.Errorf("prefill connection refused")
+					}
+					// Second attempt succeeds
+					c.Writer.WriteHeader(http.StatusOK)
+					_, _ = c.Writer.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+					return 10, nil
+				}
+			},
+			wantErr:    false,
+			wantCalls:  2,
+			wantStatus: http.StatusOK,
+			callsMsg:   "must retry to second pod pair when response was not written",
+		},
+		{
+			name: "all attempts fail without write",
+			proxyHandler: func(*mockKVConnector) func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+				return func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+					return 0, fmt.Errorf("connection refused")
+				}
+			},
+			wantErr:         true,
+			wantErrContains: "all prefill/decode attempts failed",
+			wantCalls:       2,
+			wantStatus:      http.StatusInternalServerError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := datastore.New()
+			router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+
+			ctx := &framework.Context{
+				Model:       "test-model",
+				PrefillPods: []*datastore.PodInfo{info1, info2},
+				DecodePods:  []*datastore.PodInfo{info1, info2},
+			}
+
+			mockConnector := &mockKVConnector{}
+			mockConnector.proxyHandler = tt.proxyHandler(mockConnector)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"test-model"}`))
+
+			err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "test-model"}, 8000)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrContains)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantCalls, mockConnector.calls.Load(), tt.callsMsg)
+			assert.Equal(t, tt.wantStatus, w.Code)
+		})
+	}
 }

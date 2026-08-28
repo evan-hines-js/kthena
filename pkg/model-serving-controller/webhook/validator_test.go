@@ -21,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
+
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -48,7 +49,12 @@ func TestValidPodNameLength(t *testing.T) {
 						Replicas: &replicas,
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "role1", Replicas: &replicas, WorkerReplicas: 2},
+								{
+									Name:           "role1",
+									Replicas:       &replicas,
+									WorkerReplicas: 2,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -67,7 +73,12 @@ func TestValidPodNameLength(t *testing.T) {
 						Replicas: &replicas,
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "role1", Replicas: &replicas, WorkerReplicas: 2},
+								{
+									Name:           "role1",
+									Replicas:       &replicas,
+									WorkerReplicas: 2,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -93,6 +104,114 @@ func TestValidPodNameLength(t *testing.T) {
 	}
 }
 
+func TestValidateModelServingMissingReplicasDoesNotPanic(t *testing.T) {
+	validator := NewModelServingValidator()
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: v1.ObjectMeta{
+			Name: "valid-name",
+		},
+		Spec: workloadv1alpha1.ModelServingSpec{
+			Template: workloadv1alpha1.ServingGroup{
+				Roles: []workloadv1alpha1.Role{
+					{
+						Name: "role1",
+					},
+				},
+			},
+		},
+	}
+
+	var allowed bool
+	var reason string
+	assert.NotPanics(t, func() {
+		allowed, reason = validator.validateModelServing(ms)
+	})
+	assert.False(t, allowed)
+	assert.Contains(t, reason, "spec.replicas")
+	assert.Contains(t, reason, "spec.template.roles[0].replicas")
+}
+
+func TestValidGeneratedNameLengthUsesReplicaDefaultsForMissingValues(t *testing.T) {
+	replicas := int32(1)
+	longName := "this-is-a-very-long-name-that-exceeds-the-allowed-length-for-generated-name"
+	tests := []struct {
+		name    string
+		ms      *workloadv1alpha1.ModelServing
+		wantErr bool
+	}{
+		{
+			name: "missing top-level replicas",
+			ms: &workloadv1alpha1.ModelServing{
+				ObjectMeta: v1.ObjectMeta{Name: "valid-name"},
+				Spec: workloadv1alpha1.ModelServingSpec{
+					Template: workloadv1alpha1.ServingGroup{
+						Roles: []workloadv1alpha1.Role{
+							{Name: "role1", Replicas: &replicas},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "missing role replicas",
+			ms: &workloadv1alpha1.ModelServing{
+				ObjectMeta: v1.ObjectMeta{Name: "valid-name"},
+				Spec: workloadv1alpha1.ModelServingSpec{
+					Replicas: &replicas,
+					Template: workloadv1alpha1.ServingGroup{
+						Roles: []workloadv1alpha1.Role{
+							{Name: "role1"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "missing top-level replicas still validates generated name length",
+			ms: &workloadv1alpha1.ModelServing{
+				ObjectMeta: v1.ObjectMeta{Name: longName},
+				Spec: workloadv1alpha1.ModelServingSpec{
+					Template: workloadv1alpha1.ServingGroup{
+						Roles: []workloadv1alpha1.Role{
+							{Name: "role1", Replicas: &replicas},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing role replicas still validates generated name length",
+			ms: &workloadv1alpha1.ModelServing{
+				ObjectMeta: v1.ObjectMeta{Name: longName},
+				Spec: workloadv1alpha1.ModelServingSpec{
+					Replicas: &replicas,
+					Template: workloadv1alpha1.ServingGroup{
+						Roles: []workloadv1alpha1.Role{
+							{Name: "role1"},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got field.ErrorList
+			assert.NotPanics(t, func() {
+				got = validGeneratedNameLength(tt.ms)
+			})
+			if tt.wantErr {
+				assert.NotEmpty(t, got)
+				return
+			}
+			assert.Empty(t, got)
+		})
+	}
+}
+
 func TestValidateRollingUpdateConfiguration(t *testing.T) {
 	replicas := int32(3)
 	type args struct {
@@ -110,6 +229,7 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 					Spec: workloadv1alpha1.ModelServingSpec{
 						Replicas: &replicas,
 						RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+							Type: workloadv1alpha1.ServingGroupRollingUpdate,
 							RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
 								MaxUnavailable: &intstr.IntOrString{
 									Type:   intstr.Int,
@@ -121,6 +241,31 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 				},
 			},
 			want: field.ErrorList(nil),
+		},
+		{
+			name: "rejects configuration for role rolling update",
+			args: args{
+				ms: &workloadv1alpha1.ModelServing{
+					Spec: workloadv1alpha1.ModelServingSpec{
+						Replicas: &replicas,
+						RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+							Type: workloadv1alpha1.RoleRollingUpdate,
+							RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
+								MaxUnavailable: &intstr.IntOrString{
+									Type:   intstr.Int,
+									IntVal: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+			want: field.ErrorList{
+				field.Forbidden(
+					field.NewPath("spec").Child("rolloutStrategy").Child("rollingUpdateConfiguration"),
+					"rollingUpdateConfiguration is only valid when rolloutStrategy.type is ServingGroupRollingUpdate",
+				),
+			},
 		},
 		{
 			name: "invalid maxUnavailable format",
@@ -154,7 +299,7 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 						Type:   intstr.String,
 						StrVal: "invalid",
 					},
-					"invalidate maxUnavailable",
+					"invalid maxUnavailable: invalid value for IntOrString: invalid type: string is not a percentage",
 				),
 			},
 		},
@@ -184,6 +329,25 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 			},
 		},
 		{
+			name: "maxUnavailable greater than replicas is allowed for scale down",
+			args: args{
+				ms: &workloadv1alpha1.ModelServing{
+					Spec: workloadv1alpha1.ModelServingSpec{
+						Replicas: &replicas,
+						RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+							RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
+								MaxUnavailable: &intstr.IntOrString{
+									Type:   intstr.Int,
+									IntVal: 4,
+								},
+							},
+						},
+					},
+				},
+			},
+			want: field.ErrorList(nil),
+		},
+		{
 			name: "valid partition - within range",
 			args: args{
 				ms: &workloadv1alpha1.ModelServing{
@@ -195,7 +359,7 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 									Type:   intstr.Int,
 									IntVal: 1,
 								},
-								Partition: int32Ptr(1),
+								Partition: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
 							},
 						},
 					},
@@ -215,7 +379,7 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 									Type:   intstr.Int,
 									IntVal: 1,
 								},
-								Partition: int32Ptr(-1),
+								Partition: &intstr.IntOrString{Type: intstr.Int, IntVal: -1},
 							},
 						},
 					},
@@ -224,8 +388,8 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 			want: field.ErrorList{
 				field.Invalid(
 					field.NewPath("spec").Child("rolloutStrategy").Child("rollingUpdateConfiguration").Child("partition"),
-					int32(-1),
-					"partition must be greater than or equal to 0",
+					int64(-1),
+					"must be a non-negative integer",
 				),
 			},
 		},
@@ -241,7 +405,7 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 									Type:   intstr.Int,
 									IntVal: 1,
 								},
-								Partition: int32Ptr(3),
+								Partition: &intstr.IntOrString{Type: intstr.Int, IntVal: 3},
 							},
 						},
 						Template: workloadv1alpha1.ServingGroup{
@@ -273,7 +437,7 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 									Type:   intstr.Int,
 									IntVal: 1,
 								},
-								Partition: int32Ptr(5),
+								Partition: &intstr.IntOrString{Type: intstr.Int, IntVal: 5},
 							},
 						},
 						Template: workloadv1alpha1.ServingGroup{
@@ -305,13 +469,59 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 									Type:   intstr.Int,
 									IntVal: 1,
 								},
-								Partition: int32Ptr(0),
+								Partition: &intstr.IntOrString{Type: intstr.Int, IntVal: 0},
 							},
 						},
 					},
 				},
 			},
 			want: field.ErrorList(nil),
+		},
+		{
+			name: "valid partition - percentage value",
+			args: args{
+				ms: &workloadv1alpha1.ModelServing{
+					Spec: workloadv1alpha1.ModelServingSpec{
+						Replicas: &replicas,
+						RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+							RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
+								MaxUnavailable: &intstr.IntOrString{
+									Type:   intstr.Int,
+									IntVal: 1,
+								},
+								Partition: &intstr.IntOrString{Type: intstr.String, StrVal: "50%"},
+							},
+						},
+					},
+				},
+			},
+			want: field.ErrorList(nil),
+		},
+		{
+			name: "invalid partition - percentage over 100",
+			args: args{
+				ms: &workloadv1alpha1.ModelServing{
+					Spec: workloadv1alpha1.ModelServingSpec{
+						Replicas: &replicas,
+						RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+							RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{
+								MaxUnavailable: &intstr.IntOrString{
+									Type:   intstr.Int,
+									IntVal: 1,
+								},
+								Partition: &intstr.IntOrString{Type: intstr.String, StrVal: "110%"},
+							},
+						},
+					},
+				},
+			},
+			want: field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec").Child("rolloutStrategy").Child("rollingUpdateConfiguration").Child("partition"),
+					&intstr.IntOrString{Type: intstr.String, StrVal: "110%"},
+					"must be a valid percent value (0-100)",
+				),
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -321,6 +531,107 @@ func TestValidateRollingUpdateConfiguration(t *testing.T) {
 				assert.EqualValues(t, tt.want, got)
 			} else {
 				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestValidateMaxUnavailableForRoles(t *testing.T) {
+	tests := []struct {
+		name    string
+		ms      *workloadv1alpha1.ModelServing
+		wantErr bool
+	}{
+		{
+			name: "valid with role rolling update",
+			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+					Name:     "decode",
+					Replicas: ptr.To[int32](4),
+					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+						MaxUnavailable: ptr.To(intstr.FromInt(2)),
+					},
+				}}},
+			}},
+		},
+		{
+			name: "rejects zero",
+			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+					Name:     "decode",
+					Replicas: ptr.To[int32](4),
+					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+						MaxUnavailable: ptr.To(intstr.FromString("0%")),
+					},
+				}}},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "allows CRD default maxUnavailable with serving group rolling update",
+			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.ServingGroupRollingUpdate},
+				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+					Name:     "decode",
+					Replicas: ptr.To[int32](4),
+					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+						MaxUnavailable: ptr.To(intstr.FromInt(1)),
+					},
+				}}},
+			}},
+		},
+		{
+			name: "requires role rolling update for partition",
+			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.ServingGroupRollingUpdate},
+				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+					Name:     "decode",
+					Replicas: ptr.To[int32](4),
+					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+						Partition: ptr.To(intstr.FromInt(1)),
+					},
+				}}},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "rejects maxUnavailable greater than role replicas",
+			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+					Name:     "decode",
+					Replicas: ptr.To[int32](3),
+					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+						MaxUnavailable: ptr.To(intstr.FromInt(4)),
+					},
+				}}},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "allows maxUnavailable equal to role replicas",
+			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+					Name:     "decode",
+					Replicas: ptr.To[int32](3),
+					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+						MaxUnavailable: ptr.To(intstr.FromInt(3)),
+					},
+				}}},
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validateMaxUnavailableForRoles(tt.ms)
+			if tt.wantErr {
+				assert.NotEmpty(t, got)
+			} else {
+				assert.Empty(t, got)
 			}
 		})
 	}
@@ -343,8 +654,18 @@ func TestValidatorReplicas(t *testing.T) {
 						Replicas: int32Ptr(3),
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "role1", Replicas: int32Ptr(2), WorkerReplicas: 1},
-								{Name: "role2", Replicas: int32Ptr(1), WorkerReplicas: 1},
+								{
+									Name:           "role1",
+									Replicas:       int32Ptr(2),
+									WorkerReplicas: 1,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
+								{
+									Name:           "role2",
+									Replicas:       int32Ptr(1),
+									WorkerReplicas: 1,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -360,8 +681,18 @@ func TestValidatorReplicas(t *testing.T) {
 						Replicas: int32PtrNil(),
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "role1", Replicas: int32Ptr(2), WorkerReplicas: 1},
-								{Name: "role2", Replicas: int32Ptr(1), WorkerReplicas: 1},
+								{
+									Name:           "role1",
+									Replicas:       int32Ptr(2),
+									WorkerReplicas: 1,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
+								{
+									Name:           "role2",
+									Replicas:       int32Ptr(1),
+									WorkerReplicas: 1,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -371,7 +702,7 @@ func TestValidatorReplicas(t *testing.T) {
 				field.Invalid(
 					field.NewPath("spec").Child("replicas"),
 					int32PtrNil(),
-					"replicas must be a positive integer",
+					"replicas must be a non-negative integer",
 				),
 			},
 		},
@@ -383,8 +714,18 @@ func TestValidatorReplicas(t *testing.T) {
 						Replicas: int32Ptr(-1),
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "role1", Replicas: int32Ptr(2), WorkerReplicas: 1},
-								{Name: "role2", Replicas: int32Ptr(1), WorkerReplicas: 1},
+								{
+									Name:           "role1",
+									Replicas:       int32Ptr(2),
+									WorkerReplicas: 1,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
+								{
+									Name:           "role2",
+									Replicas:       int32Ptr(1),
+									WorkerReplicas: 1,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -394,7 +735,7 @@ func TestValidatorReplicas(t *testing.T) {
 				field.Invalid(
 					field.NewPath("spec").Child("replicas"),
 					int32Ptr(-1),
-					"replicas must be a positive integer",
+					"replicas must be a non-negative integer",
 				),
 			},
 		},
@@ -406,8 +747,18 @@ func TestValidatorReplicas(t *testing.T) {
 						Replicas: int32Ptr(3),
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "role1", Replicas: int32Ptr(-1), WorkerReplicas: 1},
-								{Name: "role2", Replicas: int32Ptr(1), WorkerReplicas: 1},
+								{
+									Name:           "role1",
+									Replicas:       int32Ptr(-1),
+									WorkerReplicas: 1,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
+								{
+									Name:           "role2",
+									Replicas:       int32Ptr(1),
+									WorkerReplicas: 1,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -417,7 +768,7 @@ func TestValidatorReplicas(t *testing.T) {
 				field.Invalid(
 					field.NewPath("spec").Child("template").Child("roles").Index(0).Child("replicas"),
 					int32Ptr(-1),
-					"role replicas must be a positive integer",
+					"role replicas must be a non-negative integer",
 				),
 			},
 		},
@@ -429,8 +780,18 @@ func TestValidatorReplicas(t *testing.T) {
 						Replicas: int32Ptr(3),
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "role1", Replicas: int32PtrNil(), WorkerReplicas: 1},
-								{Name: "role2", Replicas: int32Ptr(1), WorkerReplicas: 1},
+								{
+									Name:           "role1",
+									Replicas:       int32PtrNil(),
+									WorkerReplicas: 1,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
+								{
+									Name:           "role2",
+									Replicas:       int32Ptr(1),
+									WorkerReplicas: 1,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -440,7 +801,7 @@ func TestValidatorReplicas(t *testing.T) {
 				field.Invalid(
 					field.NewPath("spec").Child("template").Child("roles").Index(0).Child("replicas"),
 					int32PtrNil(),
-					"role replicas must be a positive integer",
+					"role replicas must be a non-negative integer",
 				),
 			},
 		},
@@ -500,11 +861,12 @@ func TestValidateGangPolicy(t *testing.T) {
 									Name:           "worker",
 									Replicas:       &roleReplicas,
 									WorkerReplicas: 3,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
 								},
 							},
 							GangPolicy: &workloadv1alpha1.GangPolicy{
 								MinRoleReplicas: map[string]int32{
-									"worker": 2, // 2 (role replicas) >= 2 (min), valid
+									"worker": 2,
 								},
 							},
 						},
@@ -525,6 +887,7 @@ func TestValidateGangPolicy(t *testing.T) {
 									Name:           "worker",
 									Replicas:       &roleReplicas,
 									WorkerReplicas: 3,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
 								},
 							},
 							GangPolicy: &workloadv1alpha1.GangPolicy{
@@ -556,6 +919,7 @@ func TestValidateGangPolicy(t *testing.T) {
 									Name:           "worker",
 									Replicas:       &roleReplicas,
 									WorkerReplicas: 3,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
 								},
 							},
 							GangPolicy: &workloadv1alpha1.GangPolicy{
@@ -587,6 +951,7 @@ func TestValidateGangPolicy(t *testing.T) {
 									Name:           "worker",
 									Replicas:       &roleReplicas,
 									WorkerReplicas: 3,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
 								},
 							},
 							GangPolicy: &workloadv1alpha1.GangPolicy{
@@ -618,6 +983,7 @@ func TestValidateGangPolicy(t *testing.T) {
 									Name:           "worker",
 									Replicas:       &roleReplicas,
 									WorkerReplicas: 3,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
 								},
 							},
 							GangPolicy: nil,
@@ -639,6 +1005,7 @@ func TestValidateGangPolicy(t *testing.T) {
 									Name:           "worker",
 									Replicas:       &roleReplicas,
 									WorkerReplicas: 3,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
 								},
 							},
 							GangPolicy: &workloadv1alpha1.GangPolicy{
@@ -675,25 +1042,33 @@ func TestValidateWorkerReplicas(t *testing.T) {
 		want field.ErrorList
 	}{
 		{
-			name: "valid worker replicas",
+			name: "WorkerReplicas > 0 but WorkerTemplate is nil",
 			args: args{
 				ms: &workloadv1alpha1.ModelServing{
 					Spec: workloadv1alpha1.ModelServingSpec{
-						Replicas: &replicas,
+						Replicas: &replicas, // It Uses the variable defined at top of test
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
 								{
 									Name:           "worker",
 									Replicas:       &roleReplicas,
-									WorkerReplicas: 3,
+									WorkerReplicas: 1,   // > 0 to trigger the check
+									WorkerTemplate: nil, // Missing template!
 								},
 							},
 						},
 					},
 				},
 			},
-			want: field.ErrorList(nil),
+
+			want: field.ErrorList{
+				field.Required(
+					field.NewPath("spec").Child("template").Child("roles").Index(0).Child("workerTemplate"),
+					"workerTemplate is required when workerReplicas is greater than 0",
+				),
+			},
 		},
+
 		{
 			name: "valid zero worker replicas",
 			args: args{
@@ -752,6 +1127,7 @@ func TestValidateWorkerReplicas(t *testing.T) {
 									Name:           "worker1",
 									Replicas:       &roleReplicas,
 									WorkerReplicas: 3,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
 								},
 								{
 									Name:           "worker2",
@@ -802,8 +1178,18 @@ func TestValidateRoleNames(t *testing.T) {
 						Replicas: &replicas,
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "prefill", Replicas: &replicas, WorkerReplicas: 2},
-								{Name: "decode", Replicas: &replicas, WorkerReplicas: 2},
+								{
+									Name:           "prefill",
+									Replicas:       &replicas,
+									WorkerReplicas: 2,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
+								{
+									Name:           "decode",
+									Replicas:       &replicas,
+									WorkerReplicas: 2,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -819,7 +1205,12 @@ func TestValidateRoleNames(t *testing.T) {
 						Replicas: &replicas,
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "Prefill", Replicas: &replicas, WorkerReplicas: 2},
+								{
+									Name:           "Prefill",
+									Replicas:       &replicas,
+									WorkerReplicas: 2,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -841,7 +1232,12 @@ func TestValidateRoleNames(t *testing.T) {
 						Replicas: &replicas,
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "1role", Replicas: &replicas, WorkerReplicas: 2},
+								{
+									Name:           "1role",
+									Replicas:       &replicas,
+									WorkerReplicas: 2,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -863,7 +1259,12 @@ func TestValidateRoleNames(t *testing.T) {
 						Replicas: &replicas,
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "role-", Replicas: &replicas, WorkerReplicas: 2},
+								{
+									Name:           "role-",
+									Replicas:       &replicas,
+									WorkerReplicas: 2,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -885,8 +1286,18 @@ func TestValidateRoleNames(t *testing.T) {
 						Replicas: &replicas,
 						Template: workloadv1alpha1.ServingGroup{
 							Roles: []workloadv1alpha1.Role{
-								{Name: "prefill", Replicas: &replicas, WorkerReplicas: 2},
-								{Name: "Decode", Replicas: &replicas, WorkerReplicas: 2},
+								{
+									Name:           "prefill",
+									Replicas:       &replicas,
+									WorkerReplicas: 2,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
+								{
+									Name:           "Decode",
+									Replicas:       &replicas,
+									WorkerReplicas: 2,
+									WorkerTemplate: &workloadv1alpha1.PodTemplateSpec{}, // <--- FIXED TYPE
+								},
 							},
 						},
 					},
@@ -915,6 +1326,173 @@ func TestValidateRoleNames(t *testing.T) {
 				}
 			} else {
 				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestValidateRecoveryPolicyAndRolloutStrategy(t *testing.T) {
+	replicas := int32(3)
+
+	type args struct {
+		ms *workloadv1alpha1.ModelServing
+	}
+	tests := []struct {
+		name string
+		args args
+		want field.ErrorList
+	}{
+		{
+			name: "no recovery policy and no rollout strategy - valid",
+			args: args{
+				ms: &workloadv1alpha1.ModelServing{
+					ObjectMeta: v1.ObjectMeta{
+						Name: "test-model-serving",
+					},
+					Spec: workloadv1alpha1.ModelServingSpec{
+						Replicas: &replicas,
+						Template: workloadv1alpha1.ServingGroup{
+							Roles: []workloadv1alpha1.Role{
+								{Name: "role1", Replicas: &replicas, WorkerReplicas: 2},
+							},
+						},
+					},
+				},
+			},
+			want: field.ErrorList(nil),
+		},
+		{
+			name: "serving group recovery policy with role rollout strategy - invalid",
+			args: args{
+				ms: &workloadv1alpha1.ModelServing{
+					ObjectMeta: v1.ObjectMeta{
+						Name: "test-model-serving",
+					},
+					Spec: workloadv1alpha1.ModelServingSpec{
+						Replicas:       &replicas,
+						RecoveryPolicy: workloadv1alpha1.ServingGroupRecreate,
+						RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+							Type: workloadv1alpha1.RoleRollingUpdate,
+						},
+						Template: workloadv1alpha1.ServingGroup{
+							Roles: []workloadv1alpha1.Role{
+								{Name: "role1", Replicas: &replicas, WorkerReplicas: 2},
+							},
+						},
+					},
+				},
+			},
+			want: field.ErrorList{
+				field.Invalid(
+					field.NewPath("spec").Child("rolloutStrategy").Child("type"),
+					workloadv1alpha1.RoleRollingUpdate,
+					"incompatible recoveryPolicy and rolloutStrategy.type after applying defaults: recoveryPolicy=ServingGroupRecreate, rolloutStrategy.type=RoleRollingUpdate; valid pairs: (ServingGroupRecreate,ServingGroupRollingUpdate) or (RoleRecreate,RoleRollingUpdate)",
+				),
+			},
+		},
+		{
+			name: "recovery policy ServingGroupRecreate with compatible rollout strategy ServingGroup - valid",
+			args: args{
+				ms: &workloadv1alpha1.ModelServing{
+					ObjectMeta: v1.ObjectMeta{
+						Name: "test-model-serving",
+					},
+					Spec: workloadv1alpha1.ModelServingSpec{
+						Replicas:       &replicas,
+						RecoveryPolicy: workloadv1alpha1.ServingGroupRecreate,
+						RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+							Type: workloadv1alpha1.ServingGroupRollingUpdate,
+						},
+						Template: workloadv1alpha1.ServingGroup{
+							Roles: []workloadv1alpha1.Role{
+								{Name: "role1", Replicas: &replicas, WorkerReplicas: 2},
+							},
+						},
+					},
+				},
+			},
+			want: field.ErrorList(nil),
+		},
+		{
+			name: "recovery policy RoleRecreate with compatible rollout strategy Role - valid",
+			args: args{
+				ms: &workloadv1alpha1.ModelServing{
+					ObjectMeta: v1.ObjectMeta{
+						Name: "test-model-serving",
+					},
+					Spec: workloadv1alpha1.ModelServingSpec{
+						Replicas:       &replicas,
+						RecoveryPolicy: workloadv1alpha1.RoleRecreate,
+						RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+							Type: workloadv1alpha1.RoleRollingUpdate,
+						},
+						Template: workloadv1alpha1.ServingGroup{
+							Roles: []workloadv1alpha1.Role{
+								{Name: "role1", Replicas: &replicas, WorkerReplicas: 2},
+							},
+						},
+					},
+				},
+			},
+			want: field.ErrorList(nil),
+		},
+		{
+			name: "recovery policy RoleRecreate with rollout strategy ServingGroup - valid",
+			args: args{
+				ms: &workloadv1alpha1.ModelServing{
+					ObjectMeta: v1.ObjectMeta{
+						Name: "test-model-serving",
+					},
+					Spec: workloadv1alpha1.ModelServingSpec{
+						Replicas:       &replicas,
+						RecoveryPolicy: workloadv1alpha1.RoleRecreate,
+						RolloutStrategy: &workloadv1alpha1.RolloutStrategy{
+							Type: workloadv1alpha1.ServingGroupRollingUpdate,
+						},
+						Template: workloadv1alpha1.ServingGroup{
+							Roles: []workloadv1alpha1.Role{
+								{Name: "role1", Replicas: &replicas, WorkerReplicas: 2},
+							},
+						},
+					},
+				},
+			},
+			want: field.ErrorList(nil),
+		},
+		{
+			name: "serving group recovery policy without rollout strategy - valid (default rollout is ServingGroupRollingUpdate)",
+			args: args{
+				ms: &workloadv1alpha1.ModelServing{
+					ObjectMeta: v1.ObjectMeta{
+						Name: "test-model-serving",
+					},
+					Spec: workloadv1alpha1.ModelServingSpec{
+						Replicas:       &replicas,
+						RecoveryPolicy: workloadv1alpha1.ServingGroupRecreate,
+						Template: workloadv1alpha1.ServingGroup{
+							Roles: []workloadv1alpha1.Role{
+								{Name: "role1", Replicas: &replicas, WorkerReplicas: 2},
+							},
+						},
+					},
+				},
+			},
+			want: field.ErrorList(nil),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validateRecoveryPolicyAndRolloutStrategy(tt.args.ms)
+
+			// Compare the error lists
+			if len(got) != len(tt.want) {
+				t.Errorf("validateRecoveryPolicyAndRolloutStrategy() = %v, want %v", got, tt.want)
+				return
+			}
+
+			for i := range got {
+				assert.Equalf(t, tt.want[i].Error(), got[i].Error(), "Error mismatch at index %d", i)
 			}
 		})
 	}

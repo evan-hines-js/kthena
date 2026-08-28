@@ -180,6 +180,35 @@ func (l *accessLoggerImpl) formatText(entry *AccessLogEntry) (string, error) {
 	if entry.RequestID != "" {
 		fmt.Fprintf(&line, " request_id=%s", entry.RequestID)
 	}
+	if entry.BackendType != "" {
+		fmt.Fprintf(&line, " backend_type=%s", entry.BackendType)
+	}
+	if entry.BackendName != "" {
+		fmt.Fprintf(&line, " backend_name=%s", entry.BackendName)
+	}
+	if entry.UpstreamModel != "" {
+		fmt.Fprintf(&line, " upstream_model=%s", entry.UpstreamModel)
+	}
+	if entry.UpstreamStatusCode > 0 {
+		fmt.Fprintf(&line, " upstream_status_code=%d", entry.UpstreamStatusCode)
+	}
+	if entry.UpstreamAttempts > 0 {
+		fmt.Fprintf(&line, " upstream_attempts=%d", entry.UpstreamAttempts)
+	}
+	if entry.ErrorOrigin != "" {
+		fmt.Fprintf(&line, " error_origin=%s", entry.ErrorOrigin)
+	}
+
+	// Add Gateway API / Inference Extension fields (if present)
+	if entry.Gateway != "" {
+		fmt.Fprintf(&line, " gateway=%s", entry.Gateway)
+	}
+	if entry.HTTPRoute != "" {
+		fmt.Fprintf(&line, " http_route=%s", entry.HTTPRoute)
+	}
+	if entry.InferencePool != "" {
+		fmt.Fprintf(&line, " inference_pool=%s", entry.InferencePool)
+	}
 
 	// Add token information
 	if entry.InputTokens > 0 || entry.OutputTokens > 0 {

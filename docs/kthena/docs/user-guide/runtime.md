@@ -1,12 +1,13 @@
 # Runtime
 
-Kthena Runtime is a lightweight sidecar service designed to standardize Prometheus metrics from inference engines, provides LoRA adapter download/load/unload capabilities, and supports model downloading.
+Kthena Runtime is a lightweight sidecar service designed to standardize Prometheus metrics from inference engines, provide LoRA adapter download/load/unload capabilities, support model downloading, and publish KV cache events to Redis for the `kvcache-aware` router plugin.
 
 ## Overview
 
 - Metrics standardization: fetch native metrics from the engine's /metrics endpoint, rename them to unified Kthena metrics according to rules.
 - LoRA lifecycle management: simple HTTP APIs to download+load and unload LoRA adapters for dynamic enable/disable.
 - Model downloading: supports downloading models from S3/OBS/PVC/HuggingFace to a local path.
+- KV cache event ingestion: for vLLM engines, subscribes to the ZMQ `kv-events` stream and writes standardized token block hashes into Redis, enabling the router's [`kvcache-aware`](kvcache-aware.md) score plugin.
 
 Notes:
 
@@ -14,7 +15,7 @@ Notes:
 
 ## Installation
 
-- Runtime does not support separate installation.  it will be automatically deployed alongside the inference container as a sidecar when you are using `ModelBooster` to deploy llm.
+- Runtime does not support separate installation. It will be automatically deployed alongside the inference container as a sidecar when you are using `ModelBooster` to deploy an LLM.
 - When deploying via the ModelBooster CR (one-stop deployment), no additional configuration is needed; ModelServing will automatically enable the runtime feature.
 - For standalone deployment using ModelServing YAML, you can add the following configuration to start Runtime as sidecar container:
 
@@ -105,7 +106,7 @@ spec:
     workers:
       - type: server
         image: openeuler/vllm-ascend:latest
-        replicase: 1
+        replicas: 1
         pods: 1
         resources:
           limits:
@@ -166,7 +167,7 @@ spec:
     workers:
       - type: server
         image: openeuler/vllm-ascend:latest
-        replicase: 1
+        replicas: 1
         pods: 1
 ```
 

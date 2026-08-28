@@ -18,11 +18,14 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"os"
 	"time"
 
 	clientset "github.com/volcano-sh/kthena/client-go/clientset/versioned"
 	autoscaler "github.com/volcano-sh/kthena/pkg/autoscaler/controller"
+	"github.com/volcano-sh/kthena/pkg/kube"
 	modelbooster "github.com/volcano-sh/kthena/pkg/model-booster-controller/controller"
 	"github.com/volcano-sh/kthena/pkg/model-booster-controller/utils"
 	modelserving "github.com/volcano-sh/kthena/pkg/model-serving-controller/controller"
@@ -30,7 +33,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/klog/v2"
@@ -50,7 +52,7 @@ const (
 )
 
 func SetupController(ctx context.Context, cc Config) {
-	config, err := clientcmd.BuildConfigFromFlags(cc.MasterURL, cc.Kubeconfig)
+	config, err := kube.BuildConfig(cc.MasterURL, cc.Kubeconfig)
 	if err != nil {
 		klog.Fatalf("build client config: %v", err)
 	}
@@ -94,11 +96,7 @@ func SetupController(ctx context.Context, cc Config) {
 					klog.Info("LeaderWorkerSet CRD not found, LWS support disabled")
 				}
 			case AutoscalerController:
-				namespace, err := utils.GetInClusterNameSpace()
-				if err != nil {
-					klog.Fatalf("failed to get in-cluster namespace: %v", err)
-				}
-				ac = autoscaler.NewAutoscaleController(kubeClient, client, namespace)
+				ac = autoscaler.NewAutoscaleController(kubeClient, client, cc.AutoscalingSyncPeriodSeconds)
 			}
 		}
 	}
@@ -124,6 +122,35 @@ func SetupController(ctx context.Context, cc Config) {
 		if ac != nil {
 			go ac.Run(ctx)
 			klog.Info("Autoscaler controller started")
+		}
+
+		if cc.DebugPort > 0 {
+			go func() {
+				debugMux := http.ServeMux{}
+				if msc != nil {
+					msc.RegisterModelServingDebugEndpoints(&debugMux)
+				}
+				// Ensure the debug server is only accessible locally for security reasons
+				debugAddr := fmt.Sprintf("localhost:%d", cc.DebugPort)
+				klog.Infof("Starting debug server on %s", debugAddr)
+				server := &http.Server{
+					Addr:              debugAddr,
+					Handler:           &debugMux,
+					ReadHeaderTimeout: 5 * time.Second,
+					ReadTimeout:       10 * time.Second,
+					WriteTimeout:      10 * time.Second,
+					IdleTimeout:       30 * time.Second,
+				}
+				go func() {
+					<-ctx.Done()
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					_ = server.Shutdown(shutdownCtx)
+				}()
+				if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					klog.Errorf("Debug server failed: %v", err)
+				}
+			}()
 		}
 	}
 

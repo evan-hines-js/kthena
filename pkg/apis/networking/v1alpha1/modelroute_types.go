@@ -26,7 +26,7 @@ import (
 type ModelRouteSpec struct {
 	// `model` in the LLM request, it could be a base model name, lora adapter name or even
 	// a virtual model name. This field is used to match scenarios other than model adapter name and
-	// this field could be empty, but it and  `ModelAdapters` can't both be empty.
+	// this field could be empty, but it and `ModelAdapters` can't both be empty.
 	//
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="modelName is immutable"
 	ModelName string `json:"modelName,omitempty"`
@@ -63,6 +63,7 @@ type Rule struct {
 	// Empty `modelMatch` means matching all requests.
 	// +optional
 	ModelMatch *ModelMatch `json:"modelMatch,omitempty"`
+	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
 	TargetModels []*TargetModel `json:"targetModels"`
 }
@@ -102,12 +103,19 @@ type StringMatch struct {
 	Regex  *string `json:"regex,omitempty"`
 }
 
-// LLM inference traffic target model
+// LLM inference traffic target model.
+// +kubebuilder:validation:XValidation:rule="(has(self.modelServerName) && self.modelServerName != \"\") != (has(self.externalModelProviderName) && self.externalModelProviderName != \"\")",message="exactly one of modelServerName or externalModelProviderName must be set"
 type TargetModel struct {
 	// ModelServerName is used to specify the correlated modelServer within the same namespace.
+	// It is mutually exclusive with ExternalModelProviderName.
 	//
-	// +kubebuilder:validation:required
-	ModelServerName string `json:"modelServerName"`
+	// +optional
+	ModelServerName string `json:"modelServerName,omitempty"`
+	// ExternalModelProviderName is used to specify the correlated ExternalModelProvider within the same namespace.
+	// It is mutually exclusive with ModelServerName.
+	//
+	// +optional
+	ExternalModelProviderName string `json:"externalModelProviderName,omitempty"`
 	// Weight is used to specify the percentage of traffic should be sent to the target model.
 	// The value should be in the range of [0, 100].
 	//
@@ -172,6 +180,7 @@ type ModelRouteStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:storageversion
 // +genclient
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 //
 // ModelRoute is the Schema for the Modelroutes API.
 type ModelRoute struct {

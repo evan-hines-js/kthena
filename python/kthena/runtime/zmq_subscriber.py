@@ -143,6 +143,8 @@ class VLLMZMQSubscriber:
 
             logger.info(f"Connected to ZMQ endpoint: {self.config.zmq_endpoint}")
 
+            expected_topic = self.config.zmq_topic_filter
+
             while self.running:
                 try:
                     parts = await self.socket.recv_multipart(zmq.NOBLOCK)
@@ -151,7 +153,7 @@ class VLLMZMQSubscriber:
                         continue
 
                     topic, payload = self._extract_message_data(parts)
-                    if not topic or topic != "kv-events":
+                    if expected_topic and topic != expected_topic:
                         continue
 
                     await self._process_message(payload, self.config.pod_identifier, self.config.model_name)
@@ -201,17 +203,17 @@ class VLLMZMQSubscriber:
                 return
 
             events_count = len(event_batch.events) if event_batch.events else 0
-            logger.info(
+            logger.debug(
                 f"Received event batch: ts={event_batch.ts}, events_count={events_count}, "
                 f"dp_rank={event_batch.data_parallel_rank}")
 
             if events_count == 0:
-                logger.info("Empty event batch received")
+                logger.debug("Empty event batch received")
                 return
 
             for i, event in enumerate(event_batch.events):
                 try:
-                    logger.info(f"Processing event {i}: type={type(event).__name__}")
+                    logger.debug(f"Processing event {i}: type={type(event).__name__}")
                     await self._process_event(event, event_batch.ts, pod_identifier, model_name,
                                               event_batch.data_parallel_rank)
                 except (ValueError, TypeError, AttributeError) as e:

@@ -24,7 +24,10 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -158,6 +161,16 @@ func startForwarder(namespace, podName string, localPort, podPort int) (PortForw
 	return f, nil
 }
 
+// AllocateLocalPort binds to 127.0.0.1:0 and returns the allocated port as a string.
+func AllocateLocalPort(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := fmt.Sprintf("%d", listener.Addr().(*net.TCPAddr).Port)
+	require.NoError(t, listener.Close())
+	return port
+}
+
 // SetupPortForward sets up a port-forward to a service and waits for it to be ready.
 // It returns a PortForwarder interface that can be used to manage the port-forward.
 // If SetupPortForward fails, the test should stop immediately as the error indicates
@@ -262,7 +275,7 @@ func findPodForService(clientset *kubernetes.Clientset, namespace, serviceName s
 
 	// Find the first running pod and resolve the targetPort
 	for _, pod := range pods.Items {
-		if pod.Status.Phase == v1.PodRunning {
+		if pod.Status.Phase == v1.PodRunning && pod.DeletionTimestamp == nil {
 			// Resolve the container port from targetPort
 			containerPort, err := resolveContainerPort(&pod, targetPort)
 			if err != nil {
@@ -348,6 +361,9 @@ func (f *forwarder) buildK8sPortForwarder(readyCh chan struct{}) (*portforward.P
 	}
 	if pod.Status.Phase != v1.PodRunning {
 		return nil, fmt.Errorf("pod is not running. Status=%v", pod.Status.Phase)
+	}
+	if pod.DeletionTimestamp != nil {
+		return nil, fmt.Errorf("pod %s/%s is terminating", pod.Namespace, pod.Name)
 	}
 
 	return fw, nil

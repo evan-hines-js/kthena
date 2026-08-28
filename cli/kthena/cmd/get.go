@@ -26,6 +26,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/volcano-sh/kthena/client-go/clientset/versioned"
+	workload "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/yaml"
@@ -106,15 +107,6 @@ var getAutoscalingPoliciesCmd = &cobra.Command{
 	RunE:    runGetAutoscalingPolicies,
 }
 
-// getAutoscalingPolicyBindingsCmd represents the get autoscaling-policy-bindings command
-var getAutoscalingPolicyBindingsCmd = &cobra.Command{
-	Use:     "autoscaling-policy-bindings",
-	Aliases: []string{"aspb", "autoscaling-policy-binding"},
-	Short:   "List autoscaling policy bindings",
-	Long:    `List AutoscalingPolicyBinding resources in the cluster.`,
-	RunE:    runGetAutoscalingPolicyBindings,
-}
-
 func init() {
 	rootCmd.AddCommand(getCmd)
 	getCmd.AddCommand(getTemplatesCmd)
@@ -122,7 +114,8 @@ func init() {
 	getCmd.AddCommand(getModelBoostersCmd)
 	getCmd.AddCommand(getModelServingsCmd)
 	getCmd.AddCommand(getAutoscalingPoliciesCmd)
-	getCmd.AddCommand(getAutoscalingPolicyBindingsCmd)
+	getCmd.AddCommand(getModelRoutesCmd)
+	getCmd.AddCommand(getModelServersCmd)
 
 	// Add output format flag
 	getCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", "", "Output format (yaml|json|table)")
@@ -217,37 +210,100 @@ func runGetTemplate(cmd *cobra.Command, args []string) error {
 	return w.Flush()
 }
 
-func getKthenaClient() (*versioned.Clientset, error) {
-	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load kubeconfig: %v", err)
-	}
-
-	client, err := versioned.NewForConfig(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create kthena client: %v", err)
-	}
-
-	return client, nil
+// newKubeConfig builds the deferred client config with kubectl's precedence:
+// the KUBECONFIG path list first, then ~/.kube/config. Every CLI entry point
+// that talks to the cluster should load through this one helper.
+func newKubeConfig() clientcmd.ClientConfig {
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{})
 }
 
-func resolveGetNamespace() string {
+// getKthenaClient builds a kthena clientset and also returns the namespace
+// from the current kubeconfig context so callers can fall back to it when
+// the user hasn't passed -n/--namespace explicitly.
+func getKthenaClient() (client *versioned.Clientset, contextNamespace string, err error) {
+	kubeConfig := newKubeConfig()
+
+	restConfig, err := kubeConfig.ClientConfig()
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to load kubeconfig: %v", err)
+	}
+
+	client, err = versioned.NewForConfig(restConfig)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create kthena client: %v", err)
+	}
+
+	// Namespace() falls back to "default" itself if the context has none set
+	// so contextNamespace is always non empty on success
+	contextNamespace, _, err = kubeConfig.Namespace()
+	if err != nil {
+		contextNamespace = "default"
+	}
+
+	return client, contextNamespace, nil
+}
+
+// resolveGetNamespace picks the effective namespace with kubectl's usual
+// precedence: --all-namespaces wins outright, then an explicit -n/--namespace
+// flag, then the current kubeconfig context's namespace.
+func resolveGetNamespace(contextNamespace string) string {
 	if getAllNamespaces {
 		return ""
 	}
 	if getNamespace != "" {
 		return getNamespace
 	}
-	return "default"
+	return contextNamespace
+}
+
+// getModelServingStatus derives a human-readable status from ModelServing conditions.
+func getModelServingStatus(conditions []metav1.Condition) string {
+	for _, c := range conditions {
+		if c.Type == string(workload.ModelServingAvailable) && c.Status == metav1.ConditionTrue {
+			return "Available"
+		}
+	}
+	for _, c := range conditions {
+		if c.Type == string(workload.ModelServingUpdateInProgress) && c.Status == metav1.ConditionTrue {
+			return "Updating"
+		}
+	}
+	for _, c := range conditions {
+		if c.Type == string(workload.ModelServingProgressing) && c.Status == metav1.ConditionTrue {
+			return "Progressing"
+		}
+	}
+	return "Unknown"
+}
+
+// getModelBoosterStatus derives a human-readable status from ModelBooster conditions.
+func getModelBoosterStatus(conditions []metav1.Condition) string {
+	for _, c := range conditions {
+		if c.Type == string(workload.ModelStatusConditionTypeFailed) && c.Status == metav1.ConditionTrue {
+			return "Failed"
+		}
+	}
+	for _, c := range conditions {
+		if c.Type == string(workload.ModelStatusConditionTypeActive) && c.Status == metav1.ConditionTrue {
+			return "Active"
+		}
+	}
+	for _, c := range conditions {
+		if c.Type == string(workload.ModelStatusConditionTypeInitialized) && c.Status == metav1.ConditionTrue {
+			return "Initialized"
+		}
+	}
+	return "Unknown"
 }
 
 func runGetModelBoosters(cmd *cobra.Command, args []string) error {
-	client, err := getKthenaClient()
+	client, contextNamespace, err := getKthenaClient()
 	if err != nil {
 		return err
 	}
 
-	namespace := resolveGetNamespace()
+	namespace := resolveGetNamespace(contextNamespace)
 	ctx := context.Background()
 
 	models, err := client.WorkloadV1alpha1().ModelBoosters(namespace).List(ctx, metav1.ListOptions{})
@@ -285,19 +341,20 @@ func runGetModelBoosters(cmd *cobra.Command, args []string) error {
 	// Print header
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	if getAllNamespaces {
-		fmt.Fprintln(w, "NAMESPACE\tNAME\tAGE")
+		fmt.Fprintln(w, "NAMESPACE\tNAME\tSTATUS\tAGE")
 	} else {
-		fmt.Fprintln(w, "NAME\tAGE")
+		fmt.Fprintln(w, "NAME\tSTATUS\tAGE")
 	}
 
 	// Print matching Models
 	for _, model := range models.Items {
 		if nameFilter == "" || strings.Contains(strings.ToLower(model.Name), strings.ToLower(nameFilter)) {
 			age := time.Since(model.CreationTimestamp.Time).Truncate(time.Second)
+			status := getModelBoosterStatus(model.Status.Conditions)
 			if getAllNamespaces {
-				fmt.Fprintf(w, "%s\t%s\t%s\n", model.Namespace, model.Name, age)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", model.Namespace, model.Name, status, age)
 			} else {
-				fmt.Fprintf(w, "%s\t%s\n", model.Name, age)
+				fmt.Fprintf(w, "%s\t%s\t%s\n", model.Name, status, age)
 			}
 		}
 	}
@@ -306,12 +363,12 @@ func runGetModelBoosters(cmd *cobra.Command, args []string) error {
 }
 
 func runGetModelServings(cmd *cobra.Command, args []string) error {
-	client, err := getKthenaClient()
+	client, contextNamespace, err := getKthenaClient()
 	if err != nil {
 		return err
 	}
 
-	namespace := resolveGetNamespace()
+	namespace := resolveGetNamespace(contextNamespace)
 	ctx := context.Background()
 
 	modelServingList, err := client.WorkloadV1alpha1().ModelServings(namespace).List(ctx, metav1.ListOptions{})
@@ -331,31 +388,32 @@ func runGetModelServings(cmd *cobra.Command, args []string) error {
 	// Print header
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	if getAllNamespaces {
-		fmt.Fprintln(w, "NAMESPACE\tNAME\tAGE")
+		fmt.Fprintln(w, "NAMESPACE\tNAME\tREADY\tSTATUS\tAGE")
 	} else {
-		fmt.Fprintln(w, "NAME\tAGE")
+		fmt.Fprintln(w, "NAME\tREADY\tSTATUS\tAGE")
 	}
 
 	// Print ModelServings
 	for _, ms := range modelServingList.Items {
 		age := time.Since(ms.CreationTimestamp.Time).Truncate(time.Second)
+		ready := fmt.Sprintf("%d/%d", ms.Status.AvailableReplicas, ms.Status.Replicas)
+		status := getModelServingStatus(ms.Status.Conditions)
 		if getAllNamespaces {
-			fmt.Fprintf(w, "%s\t%s\t%s\n", ms.Namespace, ms.Name, age)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", ms.Namespace, ms.Name, ready, status, age)
 		} else {
-			fmt.Fprintf(w, "%s\t%s\n", ms.Name, age)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", ms.Name, ready, status, age)
 		}
 	}
-
 	return w.Flush()
 }
 
 func runGetAutoscalingPolicies(cmd *cobra.Command, args []string) error {
-	client, err := getKthenaClient()
+	client, contextNamespace, err := getKthenaClient()
 	if err != nil {
 		return err
 	}
 
-	namespace := resolveGetNamespace()
+	namespace := resolveGetNamespace(contextNamespace)
 	ctx := context.Background()
 
 	policies, err := client.WorkloadV1alpha1().AutoscalingPolicies(namespace).List(ctx, metav1.ListOptions{})
@@ -393,44 +451,111 @@ func runGetAutoscalingPolicies(cmd *cobra.Command, args []string) error {
 	return w.Flush()
 }
 
-func runGetAutoscalingPolicyBindings(cmd *cobra.Command, args []string) error {
-	client, err := getKthenaClient()
+var getModelRoutesCmd = &cobra.Command{
+	Use:     "model-routes",
+	Aliases: []string{"mroute", "model-route"},
+	Short:   "List model routes",
+	Long:    `List ModelRoute resources in the cluster.`,
+	RunE:    runGetModelRoutes,
+}
+
+var getModelServersCmd = &cobra.Command{
+	Use:     "model-servers",
+	Aliases: []string{"mserver", "model-server"},
+	Short:   "List model servers",
+	Long:    `List ModelServer resources in the cluster.`,
+	RunE:    runGetModelServers,
+}
+
+func runGetModelRoutes(cmd *cobra.Command, args []string) error {
+	client, contextNamespace, err := getKthenaClient()
 	if err != nil {
 		return err
 	}
 
-	namespace := resolveGetNamespace()
+	namespace := resolveGetNamespace(contextNamespace)
 	ctx := context.Background()
 
-	bindings, err := client.WorkloadV1alpha1().AutoscalingPolicyBindings(namespace).List(ctx, metav1.ListOptions{})
+	routes, err := client.NetworkingV1alpha1().ModelRoutes(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to list AutoscalingPolicyBindings: %v", err)
+		return fmt.Errorf("failed to list ModelRoutes: %v", err)
 	}
 
-	if len(bindings.Items) == 0 {
+	if len(routes.Items) == 0 {
 		if getAllNamespaces {
-			fmt.Println("No AutoscalingPolicyBindings found across all namespaces.")
+			fmt.Println("No ModelRoutes found across all namespaces.")
 		} else {
-			fmt.Printf("No AutoscalingPolicyBindings found in namespace %s.\n", namespace)
+			fmt.Printf("No ModelRoutes found in namespace %s.\n", namespace)
 		}
 		return nil
 	}
 
-	// Print header
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	if getAllNamespaces {
-		fmt.Fprintln(w, "NAMESPACE\tNAME\tAGE")
+		fmt.Fprintln(w, "NAMESPACE\tNAME\tMODEL\tRULES\tAGE")
 	} else {
-		fmt.Fprintln(w, "NAME\tAGE")
+		fmt.Fprintln(w, "NAME\tMODEL\tRULES\tAGE")
 	}
 
-	// Print AutoscalingPolicyBindings
-	for _, binding := range bindings.Items {
-		age := time.Since(binding.CreationTimestamp.Time).Truncate(time.Second)
+	for _, route := range routes.Items {
+		age := time.Since(route.CreationTimestamp.Time).Truncate(time.Second)
+		model := route.Spec.ModelName
+		if model == "" {
+			if len(route.Spec.LoraAdapters) > 0 {
+				model = strings.Join(route.Spec.LoraAdapters, ",")
+			} else {
+				model = "<lora>"
+			}
+		}
+		rules := len(route.Spec.Rules)
 		if getAllNamespaces {
-			fmt.Fprintf(w, "%s\t%s\t%s\n", binding.Namespace, binding.Name, age)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", route.Namespace, route.Name, model, rules, age)
 		} else {
-			fmt.Fprintf(w, "%s\t%s\n", binding.Name, age)
+			fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", route.Name, model, rules, age)
+		}
+	}
+
+	return w.Flush()
+}
+
+func runGetModelServers(cmd *cobra.Command, args []string) error {
+	client, contextNamespace, err := getKthenaClient()
+	if err != nil {
+		return err
+	}
+
+	namespace := resolveGetNamespace(contextNamespace)
+	ctx := context.Background()
+
+	servers, err := client.NetworkingV1alpha1().ModelServers(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list ModelServers: %v", err)
+	}
+
+	if len(servers.Items) == 0 {
+		if getAllNamespaces {
+			fmt.Println("No ModelServers found across all namespaces.")
+		} else {
+			fmt.Printf("No ModelServers found in namespace %s.\n", namespace)
+		}
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	if getAllNamespaces {
+		fmt.Fprintln(w, "NAMESPACE\tNAME\tENGINE\tPORT\tAGE")
+	} else {
+		fmt.Fprintln(w, "NAME\tENGINE\tPORT\tAGE")
+	}
+
+	for _, server := range servers.Items {
+		age := time.Since(server.CreationTimestamp.Time).Truncate(time.Second)
+		engine := string(server.Spec.InferenceEngine)
+		port := server.Spec.WorkloadPort.Port
+		if getAllNamespaces {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", server.Namespace, server.Name, engine, port, age)
+		} else {
+			fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", server.Name, engine, port, age)
 		}
 	}
 

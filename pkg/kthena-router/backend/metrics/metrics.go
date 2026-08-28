@@ -18,29 +18,49 @@ package metrics
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
+	"k8s.io/klog/v2"
 )
 
-// This function refer to aibrix(https://github.com/vllm-project/aibrix/blob/main/pkg/metrics/utils.go)
+var httpClient = &http.Client{
+	Timeout: 5 * time.Second,
+}
+
+func HTTPClient() *http.Client {
+	return httpClient
+}
+
+func PodEndpointURL(podIP string, port uint32, path string) string {
+	return "http://" + net.JoinHostPort(podIP, strconv.FormatUint(uint64(port), 10)) + path
+}
+
+// This function refers to aibrix(https://github.com/vllm-project/aibrix/blob/main/pkg/metrics/utils.go)
 func ParseMetricsURL(url string) (map[string]*dto.MetricFamily, error) {
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to fetch metrics from %s: %v", url, err)
+		return nil, fmt.Errorf("failed to fetch metrics from %s: %v", url, err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			fmt.Printf("failed to close response body: %v", err)
+			klog.Errorf("failed to close response body: %v", err)
 		}
 	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch metrics from %s: HTTP %d", url, resp.StatusCode)
+	}
 
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	allMetrics, err := parser.TextToMetricFamilies(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("Error parsing metric families: %v\n", err)
+		return nil, fmt.Errorf("error parsing metric families: %v", err)
 	}
 	return allMetrics, nil
 }
@@ -51,6 +71,17 @@ func LastPeriodAvg(previous, current *dto.Histogram) float64 {
 
 	currentSum := current.GetSampleSum()
 	currentCount := current.GetSampleCount()
+	if currentCount == 0 {
+		return 0
+	}
+
+	// Prometheus histogram sums and counts are cumulative for non-negative
+	// observations. If either value decreases, the backend process has likely
+	// restarted and reset its metrics. In that case, use the samples collected
+	// since the reset instead of subtracting values from the previous process.
+	if currentCount < previousCount || currentSum < previousSum {
+		return currentSum / float64(currentCount)
+	}
 
 	deltaSum := currentSum - previousSum
 	deltaCount := currentCount - previousCount

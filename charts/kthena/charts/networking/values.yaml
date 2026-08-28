@@ -2,6 +2,16 @@ kthenaRouter:
   # replicas is the number of kthena-router instances to run.
   replicas: 1
   enabled: true
+  # metrics configures the dedicated internal Prometheus listener.
+  metrics:
+    # port is the internal metrics listener and Service port.
+    port: 9090
+    # exposeOnRouterPort restores the legacy /metrics endpoint on the inference listener.
+    # Keep disabled when the inference Service is publicly reachable.
+    exposeOnRouterPort: false
+  service:
+    # -- Kubernetes Service type used to expose kthena-router.
+    type: LoadBalancer
   tls:
     enabled: false
     # The DNS name to use for the certificate.
@@ -34,6 +44,11 @@ kthenaRouter:
     requests:
       cpu: 100m
       memory: 128Mi
+  # -- The router will drain all in-flight requests before forcefully closing connections
+  terminationGracePeriodSeconds: 330
+  # -- Drain timeout for kthena-router graceful shutdown.
+  # -- This should be less than terminationGracePeriodSeconds.
+  drainTimeout: 5m
   # fairness configuration for request scheduling
   fairness:
     # enabled controls whether fairness scheduling is active
@@ -45,6 +60,31 @@ kthenaRouter:
     inputTokenWeight: 1.0
     # outputTokenWeight is the weight multiplier for output tokens in priority calculation (default: 2.0)
     outputTokenWeight: 2.0
+  # sessionBoost configures session-aware boosting to maximize prefix cache hits
+  # for multi-turn conversations. It is mutually exclusive with fairness.
+  sessionBoost:
+    # enabled controls whether session-boost scheduling is active
+    enabled: false
+    # header is the HTTP header used to identify conversation sessions
+    header: "X-Session-ID"
+    # maxSessions is the maximum number of recently-completed sessions kept "warm"
+    # for boosting. It bounds an LRU cache: when exceeded, the least-recently-used
+    # session is evicted automatically. Size it by the number of concurrent
+    # conversations you want to keep boosted (default: 4096).
+    maxSessions: 4096
+    # inflightPerPod is the maximum number of inflight requests admitted per backend
+    # pod. The total inflight limit is inflightPerPod multiplied by the number of
+    # backend pods. 0 or unset uses the router default (16).
+    inflightPerPod: 16
+    # gracePeriod is the wait time after a request completes for a same-session
+    # follow-up to arrive. Disabled by default (0s); enable only if you understand
+    # the latency trade-off for non-boosted requests.
+    gracePeriod: "0s"
+    # timeout is the maximum time a request may wait in the session-boost queue
+    # before it is rejected with HTTP 504. Defaults to 30s; set it to a non-positive
+    # duration (e.g. "0s") to disable the timeout, in which case a request is bounded
+    # only by client disconnect.
+    timeout: "30s"
   # accessLog configuration for request logging
   accessLog:
     # enabled controls whether access logging is active
@@ -66,26 +106,3 @@ kthenaRouter:
   # kubeAPIBurst is the burst to use while talking with kubernetes apiserver
   # If 0 or not specified, uses default value (10)
   kubeAPIBurst: 0
-
-webhook:
-  enabled: true
-  # replicas is the number of router-webhook instances to run.
-  replicas: 1
-  image:
-    # repository is the container image repository for the router-webhook.
-    repository: ghcr.io/volcano-sh/kthena-router-webhook
-    # tag is the container image tag for the router-webhook.
-    # node: edit by CI. No need to modify manually
-    tag: latest
-    # pullPolicy is the image pull policy for the router-webhook.
-    pullPolicy: IfNotPresent
-    # args are the command line arguments for the router-webhook.
-    args: ["--port=8443"]
-  # resource defines the resource limits and requests for the router-webhook.
-  resource:
-    limits:
-      cpu: 100m
-      memory: 128Mi
-    requests:
-      cpu: 100m
-      memory: 128Mi

@@ -28,7 +28,7 @@ import (
 )
 
 var (
-	GPUCacheUsage     = "gpu_usage"
+	KVCacheUsage      = "kv_cache_usage"
 	RequestWaitingNum = "request_waiting_num"
 	RequestRunningNum = "request_running_num"
 	TPOT              = "TPOT"
@@ -42,13 +42,13 @@ func GetNamespaceName(obj metav1.Object) types.NamespacedName {
 	}
 }
 
-func ParsePrompt(body map[string]interface{}) (common.ChatMessage, error) {
+func ParsePrompt(body map[string]interface{}) (*common.ChatMessage, error) {
 	if prompt, ok := body["prompt"]; ok {
 		promptStr, ok := prompt.(string)
 		if !ok {
-			return common.ChatMessage{}, fmt.Errorf("prompt is not a string")
+			return nil, fmt.Errorf("prompt is not a string")
 		}
-		return common.ChatMessage{
+		return &common.ChatMessage{
 			Text: promptStr,
 		}, nil
 	}
@@ -56,10 +56,16 @@ func ParsePrompt(body map[string]interface{}) (common.ChatMessage, error) {
 	if messages, ok := body["messages"]; ok {
 		messageList, ok := messages.([]interface{})
 		if !ok {
-			return common.ChatMessage{}, fmt.Errorf("messages is not a list")
+			return nil, fmt.Errorf("messages is not a list")
 		}
 
-		msgs := make([]common.Message, 0, len(messageList))
+		msgs := make([]common.Message, 0, len(messageList)+1)
+		if systemContent, ok := parseMessageContent(body["system"]); ok {
+			msgs = append(msgs, common.Message{
+				Role:    "system",
+				Content: systemContent,
+			})
+		}
 		for _, message := range messageList {
 			msgMap, ok := message.(map[string]interface{})
 			if !ok {
@@ -71,7 +77,7 @@ func ParsePrompt(body map[string]interface{}) (common.ChatMessage, error) {
 				continue
 			}
 
-			content, ok := msgMap["content"].(string)
+			content, ok := parseMessageContent(msgMap["content"])
 			if !ok {
 				continue
 			}
@@ -82,15 +88,97 @@ func ParsePrompt(body map[string]interface{}) (common.ChatMessage, error) {
 			})
 		}
 
-		return common.ChatMessage{
+		return &common.ChatMessage{
 			Messages: msgs,
 		}, nil
 	}
 
-	return common.ChatMessage{}, fmt.Errorf("prompt or messages not found in request body")
+	if input, ok := body["input"]; ok {
+		return parseResponsesPrompt(body["instructions"], input)
+	}
+
+	return nil, fmt.Errorf("prompt or messages not found in request body")
 }
 
-func GetPromptString(chatMessage common.ChatMessage) string {
+func parseResponsesPrompt(instructions, input any) (*common.ChatMessage, error) {
+	var msgs []common.Message
+	if instructionText, ok := instructions.(string); ok && instructionText != "" {
+		msgs = append(msgs, common.Message{Role: "developer", Content: instructionText})
+	}
+
+	parsedInput := false
+	switch value := input.(type) {
+	case string:
+		msgs = append(msgs, common.Message{Role: "user", Content: value})
+		parsedInput = true
+	case []interface{}:
+		// Responses input may contain only non-text content. Keep an empty
+		// schedulable prompt so protocol-specific validation or the upstream
+		// model can decide whether that content is supported.
+		parsedInput = true
+		for _, item := range value {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if itemType, ok := itemMap["type"].(string); ok && itemType != "" && itemType != "message" {
+				continue
+			}
+			role, ok := itemMap["role"].(string)
+			if !ok || role == "" {
+				continue
+			}
+			content, ok := parseMessageContent(itemMap["content"])
+			if !ok {
+				continue
+			}
+			msgs = append(msgs, common.Message{Role: role, Content: content})
+		}
+	default:
+		return nil, fmt.Errorf("input is not a string or list")
+	}
+	if !parsedInput {
+		return nil, fmt.Errorf("input does not contain text")
+	}
+	return &common.ChatMessage{Messages: msgs}, nil
+}
+
+func parseMessageContent(content any) (string, bool) {
+	if contentStr, ok := content.(string); ok {
+		return contentStr, true
+	}
+
+	contentList, ok := content.([]interface{})
+	if !ok {
+		return "", false
+	}
+
+	parts := make([]string, 0, len(contentList))
+	for _, item := range contentList {
+		contentMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if contentType, ok := contentMap["type"].(string); ok {
+			switch contentType {
+			case "text", "input_text", "output_text":
+			default:
+				continue
+			}
+		}
+		text, ok := contentMap["text"].(string)
+		if !ok {
+			continue
+		}
+		parts = append(parts, text)
+	}
+	if len(parts) == 0 {
+		return "", false
+	}
+	return strings.Join(parts, "\n"), true
+}
+
+func GetPromptString(chatMessage *common.ChatMessage) string {
 	// If Text field is present, return text directly (for prompt format)
 	if chatMessage.Text != "" {
 		return chatMessage.Text

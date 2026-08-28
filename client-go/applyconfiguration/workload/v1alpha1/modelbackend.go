@@ -26,16 +26,16 @@ import (
 // ModelBackendApplyConfiguration represents a declarative configuration of the ModelBackend type for use
 // with apply.
 type ModelBackendApplyConfiguration struct {
-	Name          *string                            `json:"name,omitempty"`
-	Type          *workloadv1alpha1.ModelBackendType `json:"type,omitempty"`
-	ModelURI      *string                            `json:"modelURI,omitempty"`
-	CacheURI      *string                            `json:"cacheURI,omitempty"`
-	EnvFrom       []v1.EnvFromSource                 `json:"envFrom,omitempty"`
-	Env           []v1.EnvVar                        `json:"env,omitempty"`
-	MinReplicas   *int32                             `json:"minReplicas,omitempty"`
-	MaxReplicas   *int32                             `json:"maxReplicas,omitempty"`
-	Workers       []ModelWorkerApplyConfiguration    `json:"workers,omitempty"`
-	SchedulerName *string                            `json:"schedulerName,omitempty"`
+	Name             *string                            `json:"name,omitempty"`
+	Type             *workloadv1alpha1.ModelBackendType `json:"type,omitempty"`
+	ModelURI         *string                            `json:"modelURI,omitempty"`
+	CacheURI         *string                            `json:"cacheURI,omitempty"`
+	EnvFrom          []v1.EnvFromSource                 `json:"envFrom,omitempty"`
+	Env              []v1.EnvVar                        `json:"env,omitempty"`
+	Replicas         *int32                             `json:"replicas,omitempty"`
+	Workers          []ModelWorkerApplyConfiguration    `json:"workers,omitempty"`
+	SchedulerName    *string                            `json:"schedulerName,omitempty"`
+	RuntimeClassName *string                            `json:"runtimeClassName,omitempty"`
 }
 
 // ModelBackendApplyConfiguration constructs a declarative configuration of the ModelBackend type for use with
@@ -96,19 +96,11 @@ func (b *ModelBackendApplyConfiguration) WithEnv(values ...v1.EnvVar) *ModelBack
 	return b
 }
 
-// WithMinReplicas sets the MinReplicas field in the declarative configuration to the given value
+// WithReplicas sets the Replicas field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the MinReplicas field is set to the value of the last call.
-func (b *ModelBackendApplyConfiguration) WithMinReplicas(value int32) *ModelBackendApplyConfiguration {
-	b.MinReplicas = &value
-	return b
-}
-
-// WithMaxReplicas sets the MaxReplicas field in the declarative configuration to the given value
-// and returns the receiver, so that objects can be built by chaining "With" function invocations.
-// If called multiple times, the MaxReplicas field is set to the value of the last call.
-func (b *ModelBackendApplyConfiguration) WithMaxReplicas(value int32) *ModelBackendApplyConfiguration {
-	b.MaxReplicas = &value
+// If called multiple times, the Replicas field is set to the value of the last call.
+func (b *ModelBackendApplyConfiguration) WithReplicas(value int32) *ModelBackendApplyConfiguration {
+	b.Replicas = &value
 	return b
 }
 
@@ -130,5 +122,13 @@ func (b *ModelBackendApplyConfiguration) WithWorkers(values ...*ModelWorkerApply
 // If called multiple times, the SchedulerName field is set to the value of the last call.
 func (b *ModelBackendApplyConfiguration) WithSchedulerName(value string) *ModelBackendApplyConfiguration {
 	b.SchedulerName = &value
+	return b
+}
+
+// WithRuntimeClassName sets the RuntimeClassName field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the RuntimeClassName field is set to the value of the last call.
+func (b *ModelBackendApplyConfiguration) WithRuntimeClassName(value string) *ModelBackendApplyConfiguration {
+	b.RuntimeClassName = &value
 	return b
 }

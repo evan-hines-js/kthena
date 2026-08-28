@@ -17,11 +17,13 @@ limitations under the License.
 package controller
 
 type Config struct {
-	EnableLeaderElection bool
-	Workers              int
-	Kubeconfig           string
-	MasterURL            string
-	Controllers          map[string]bool
-	KubeAPIQPS           float32
-	KubeAPIBurst         int
+	EnableLeaderElection         bool
+	Workers                      int
+	Kubeconfig                   string
+	MasterURL                    string
+	Controllers                  map[string]bool
+	KubeAPIQPS                   float32
+	KubeAPIBurst                 int
+	DebugPort                    int
+	AutoscalingSyncPeriodSeconds int
 }

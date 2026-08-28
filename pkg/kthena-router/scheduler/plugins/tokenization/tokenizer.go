@@ -16,23 +16,43 @@ limitations under the License.
 
 package tokenization
 
-import (
-	"context"
-)
+import "context"
 
 type remoteTokenizerImpl struct {
 	config  RemoteTokenizerConfig
 	client  *httpClient
 	adapter engineAdapter
+	// ownsClient distinguishes standalone tokenizers from the short-lived
+	// wrappers created by TokenizerManager around its shared client.
+	ownsClient bool
 }
 
 func NewRemoteTokenizer(config RemoteTokenizerConfig) (Tokenizer, error) {
-	adapter := newVLLMAdapter(config.Model)
-	client := newHTTPClient(config.Endpoint)
+	return newRemoteTokenizer(config, nil, true)
+}
+
+func newRemoteTokenizer(config RemoteTokenizerConfig, client *httpClient, ownsClient bool) (Tokenizer, error) {
+	engine, err := normalizeEngine(config.Engine)
+	if err != nil {
+		return nil, err
+	}
+
+	var adapter engineAdapter
+	switch engine {
+	case EngineSGLang:
+		adapter = newSGLangAdapter(config.Model)
+	case EngineVLLM:
+		adapter = newVLLMAdapter(config.Model)
+	}
+
+	if client == nil {
+		client = newHTTPClient(config.Endpoint, newRetryableHTTPClient())
+	}
 	return &remoteTokenizerImpl{
-		config:  config,
-		client:  client,
-		adapter: adapter,
+		config:     config,
+		client:     client,
+		adapter:    adapter,
+		ownsClient: ownsClient,
 	}, nil
 }
 
@@ -86,7 +106,7 @@ func (t *remoteTokenizerImpl) GetEndpoint() string {
 }
 
 func (t *remoteTokenizerImpl) Close() error {
-	if t.client != nil {
+	if t.ownsClient && t.client != nil {
 		t.client.Close()
 	}
 	return nil

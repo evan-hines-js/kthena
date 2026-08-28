@@ -18,6 +18,7 @@ package datastore
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -35,6 +36,7 @@ const (
 type TokenTracker interface {
 	GetTokenCount(user, model string) (float64, error)
 	UpdateTokenCount(user, model string, inputTokens, outputTokens float64) error
+	GetRequestCount(user, model string) (int, error)
 }
 
 // bucketNode stores the data for a single time bucket with cumulative sum.
@@ -42,6 +44,8 @@ type bucketNode struct {
 	timestamp int64
 	tokens    float64 // Token count for this specific bucket
 	cumSum    float64 // Cumulative sum up to this bucket (inclusive)
+	reqCount  int     // Request count for this specific bucket
+	reqCumSum int     // Cumulative request count up to this bucket (inclusive)
 }
 
 // userBucketData holds the token tracking data structures for a single user using a slice-based buffer.
@@ -81,13 +85,17 @@ func WithWindowSize(size time.Duration) TokenTrackerOption {
 // WithTokenWeights overrides the default token weights
 func WithTokenWeights(inputWeight, outputWeight float64) TokenTrackerOption {
 	return func(t *InMemorySlidingWindowTokenTracker) {
-		if inputWeight < 0 || outputWeight < 0 {
-			klog.Warningf("Invalid token weights: input=%v, output=%v. Weights must be non-negative", inputWeight, outputWeight)
+		if !isValidTokenWeight(inputWeight) || !isValidTokenWeight(outputWeight) {
+			klog.Warningf("Invalid token weights: input=%v, output=%v. Weights must be finite and non-negative", inputWeight, outputWeight)
 			return
 		}
 		t.inputTokenWeight = inputWeight
 		t.outputTokenWeight = outputWeight
 	}
+}
+
+func isValidTokenWeight(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
 }
 
 // NewInMemorySlidingWindowTokenTracker creates a new tracker with optional configuration
@@ -133,17 +141,27 @@ func (t *InMemorySlidingWindowTokenTracker) pruneExpiredBuckets(user, model stri
 
 	// Compact if we've skipped more than half the slice
 	if newStart > 0 && newStart >= len(bucketData.buckets)/2 {
+		tokenBase := 0.0
+		requestBase := 0
+		if newStart > 0 {
+			tokenBase = bucketData.buckets[newStart-1].cumSum
+			requestBase = bucketData.buckets[newStart-1].reqCumSum
+		}
 		// More memory-efficient compaction: explicit copy to avoid holding reference to old array
 		remainingCount := len(bucketData.buckets) - newStart
 		newBuckets := make([]bucketNode, remainingCount)
 		copy(newBuckets, bucketData.buckets[newStart:])
+		for i := range newBuckets {
+			newBuckets[i].cumSum -= tokenBase
+			newBuckets[i].reqCumSum -= requestBase
+		}
 		bucketData.buckets = newBuckets
 		bucketData.start = 0
 	}
 }
 
 // getActiveTotal computes the total tokens for the active window
-func (t *InMemorySlidingWindowTokenTracker) getActiveTotal(bucketData *userBucketData) float64 {
+func (t *InMemorySlidingWindowTokenTracker) getActiveTotal(bucketData *userBucketData, cutoff int64) float64 {
 	if bucketData == nil || bucketData.start >= len(bucketData.buckets) {
 		return 0
 	}
@@ -153,9 +171,45 @@ func (t *InMemorySlidingWindowTokenTracker) getActiveTotal(bucketData *userBucke
 		return 0
 	}
 
+	startIdx := bucketData.start
+	for startIdx <= end && bucketData.buckets[startIdx].timestamp < cutoff {
+		startIdx++
+	}
+
+	if startIdx > end {
+		return 0
+	}
+
 	total := bucketData.buckets[end].cumSum
-	if bucketData.start > 0 {
-		total -= bucketData.buckets[bucketData.start-1].cumSum
+	if startIdx > 0 {
+		total -= bucketData.buckets[startIdx-1].cumSum
+	}
+	return total
+}
+
+// getActiveRequestCount computes the total request count for the active window
+func (t *InMemorySlidingWindowTokenTracker) getActiveRequestCount(bucketData *userBucketData, cutoff int64) int {
+	if bucketData == nil || bucketData.start >= len(bucketData.buckets) {
+		return 0
+	}
+
+	end := len(bucketData.buckets) - 1
+	if end < bucketData.start {
+		return 0
+	}
+
+	startIdx := bucketData.start
+	for startIdx <= end && bucketData.buckets[startIdx].timestamp < cutoff {
+		startIdx++
+	}
+
+	if startIdx > end {
+		return 0
+	}
+
+	total := bucketData.buckets[end].reqCumSum
+	if startIdx > 0 {
+		total -= bucketData.buckets[startIdx-1].reqCumSum
 	}
 	return total
 }
@@ -166,49 +220,21 @@ func (t *InMemorySlidingWindowTokenTracker) GetTokenCount(user, model string) (f
 		return 0, nil
 	}
 
+	cutoff := t.getCutoffTimestamp()
+
 	t.mu.RLock()
+	defer t.mu.RUnlock()
+
 	modelBuckets, userOk := t.userBucketStore[user]
 	if !userOk || modelBuckets == nil {
-		t.mu.RUnlock()
 		return 0, nil
 	}
 	bucketData, modelOk := modelBuckets[model]
 	if !modelOk || bucketData == nil || bucketData.start >= len(bucketData.buckets) {
-		t.mu.RUnlock()
 		return 0, nil
 	}
 
-	cutoff := t.getCutoffTimestamp()
-	needsPruning := false
-
-	if bucketData.start < len(bucketData.buckets) {
-		oldestTs := bucketData.buckets[bucketData.start].timestamp
-		if oldestTs < cutoff {
-			needsPruning = true
-		}
-	}
-	t.mu.RUnlock()
-
-	// Only acquire write lock if we need to prune
-	if needsPruning {
-		t.mu.Lock()
-		// Re-check user data existence in case it was deleted between RUnlock and Lock
-		if modelBuckets, userOk := t.userBucketStore[user]; userOk {
-			if _, modelOk := modelBuckets[model]; modelOk {
-				t.pruneExpiredBuckets(user, model, cutoff)
-			}
-		}
-		t.mu.Unlock()
-	}
-
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if modelBuckets, userOk := t.userBucketStore[user]; userOk {
-		if bucketData, modelOk := modelBuckets[model]; modelOk {
-			return t.getActiveTotal(bucketData), nil
-		}
-	}
-	return 0, nil
+	return t.getActiveTotal(bucketData, cutoff), nil
 }
 
 func (t *InMemorySlidingWindowTokenTracker) UpdateTokenCount(user, model string, inputTokens, outputTokens float64) error {
@@ -253,18 +279,47 @@ func (t *InMemorySlidingWindowTokenTracker) UpdateTokenCount(user, model string,
 		// Update last bucket
 		bucketData.buckets[end-1].tokens += newTokens
 		bucketData.buckets[end-1].cumSum += newTokens
+		bucketData.buckets[end-1].reqCount++
+		bucketData.buckets[end-1].reqCumSum++
 	} else {
 		// Append new bucket
 		cumSum := newTokens
+		reqCumSum := 1
 		if end > 0 {
 			cumSum += bucketData.buckets[end-1].cumSum
+			reqCumSum += bucketData.buckets[end-1].reqCumSum
 		}
 		bucketData.buckets = append(bucketData.buckets, bucketNode{
 			timestamp: currentTimestamp,
 			tokens:    newTokens,
 			cumSum:    cumSum,
+			reqCount:  1,
+			reqCumSum: reqCumSum,
 		})
 	}
 
 	return nil
+}
+
+// GetRequestCount returns the total request count for a user/model in the current sliding window.
+func (t *InMemorySlidingWindowTokenTracker) GetRequestCount(user, model string) (int, error) {
+	if user == "" || model == "" {
+		return 0, nil
+	}
+
+	cutoff := t.getCutoffTimestamp()
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	modelBuckets, userOk := t.userBucketStore[user]
+	if !userOk || modelBuckets == nil {
+		return 0, nil
+	}
+	bucketData, modelOk := modelBuckets[model]
+	if !modelOk || bucketData == nil || bucketData.start >= len(bucketData.buckets) {
+		return 0, nil
+	}
+
+	return t.getActiveRequestCount(bucketData, cutoff), nil
 }

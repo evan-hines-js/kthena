@@ -39,6 +39,19 @@ type AccessLogEntry struct {
 	SelectedPod string `json:"selected_pod,omitempty"`
 	RequestID   string `json:"request_id,omitempty"`
 
+	// Destination-neutral upstream information.
+	BackendType        string `json:"backend_type,omitempty"`
+	BackendName        string `json:"backend_name,omitempty"`
+	UpstreamModel      string `json:"upstream_model,omitempty"`
+	UpstreamStatusCode int    `json:"upstream_status_code,omitempty"`
+	UpstreamAttempts   int    `json:"upstream_attempts,omitempty"`
+	ErrorOrigin        string `json:"error_origin,omitempty"`
+
+	// Gateway API / Gateway API Inference Extension information
+	Gateway       string `json:"gateway,omitempty"`
+	HTTPRoute     string `json:"http_route,omitempty"`
+	InferencePool string `json:"inference_pool,omitempty"`
+
 	// Token information
 	InputTokens  int `json:"input_tokens,omitempty"`
 	OutputTokens int `json:"output_tokens,omitempty"`
@@ -59,15 +72,25 @@ type ErrorInfo struct {
 // AccessLogContext tracks timing and metadata throughout request lifecycle
 type AccessLogContext struct {
 	// Request metadata
-	RequestID   string
-	StartTime   time.Time
-	Method      string
-	Path        string
-	Protocol    string
-	ModelName   string
-	ModelRoute  string
-	ModelServer string
-	SelectedPod string
+	RequestID     string
+	StartTime     time.Time
+	Method        string
+	Path          string
+	Protocol      string
+	ModelName     string
+	ModelRoute    string
+	ModelServer   string
+	SelectedPod   string
+	Gateway       string
+	HTTPRoute     string
+	InferencePool string
+
+	BackendType        string
+	BackendName        string
+	UpstreamModel      string
+	UpstreamStatusCode int
+	UpstreamAttempts   int
+	ErrorOrigin        string
 
 	// Token counts
 	InputTokens  int
@@ -107,6 +130,41 @@ func (ctx *AccessLogContext) SetModelRouting(modelRoute string, modelServer stri
 	ctx.ModelRoute = modelRoute
 	ctx.ModelServer = modelServer
 	ctx.SelectedPod = selectedPod
+}
+
+// SetBackendInfo sets destination-neutral backend information.
+func (ctx *AccessLogContext) SetBackendInfo(backendType, backendName, upstreamModel string) {
+	ctx.BackendType = backendType
+	ctx.BackendName = backendName
+	ctx.UpstreamModel = upstreamModel
+}
+
+// SetUpstreamInfo sets upstream attempt outcome information.
+func (ctx *AccessLogContext) SetUpstreamInfo(statusCode, attempts int) {
+	if statusCode > 0 {
+		ctx.UpstreamStatusCode = statusCode
+	}
+	if attempts > 0 {
+		ctx.UpstreamAttempts = attempts
+	}
+}
+
+// SetErrorOrigin sets the bounded error origin.
+func (ctx *AccessLogContext) SetErrorOrigin(origin string) {
+	ctx.ErrorOrigin = origin
+}
+
+// SetGatewayAPIInfo sets Gateway API related information (if available).
+func (ctx *AccessLogContext) SetGatewayAPIInfo(gateway, httpRoute, inferencePool string) {
+	if gateway != "" {
+		ctx.Gateway = gateway
+	}
+	if httpRoute != "" {
+		ctx.HTTPRoute = httpRoute
+	}
+	if inferencePool != "" {
+		ctx.InferencePool = inferencePool
+	}
 }
 
 // SetTokenCounts sets the input and output token counts
@@ -187,6 +245,15 @@ func (ctx *AccessLogContext) ToAccessLogEntry(statusCode int) *AccessLogEntry {
 		ModelServer:                modelServerName,
 		SelectedPod:                ctx.SelectedPod,
 		RequestID:                  ctx.RequestID,
+		BackendType:                ctx.BackendType,
+		BackendName:                ctx.BackendName,
+		UpstreamModel:              ctx.UpstreamModel,
+		UpstreamStatusCode:         ctx.UpstreamStatusCode,
+		UpstreamAttempts:           ctx.UpstreamAttempts,
+		ErrorOrigin:                ctx.ErrorOrigin,
+		Gateway:                    ctx.Gateway,
+		HTTPRoute:                  ctx.HTTPRoute,
+		InferencePool:              ctx.InferencePool,
 		InputTokens:                ctx.InputTokens,
 		OutputTokens:               ctx.OutputTokens,
 		DurationTotal:              total,

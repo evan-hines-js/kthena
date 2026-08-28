@@ -16,10 +16,41 @@ limitations under the License.
 package datastore
 
 import (
+	"math"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestPruneExpiredBuckets_RebasesCumulativeCountsAfterCompaction(t *testing.T) {
+	tracker := NewInMemorySlidingWindowTokenTracker().(*InMemorySlidingWindowTokenTracker)
+	tracker.userBucketStore["user1"] = map[string]*userBucketData{
+		"model1": {
+			buckets: []bucketNode{
+				{timestamp: 1, tokens: 1, cumSum: 1, reqCount: 1, reqCumSum: 1},
+				{timestamp: 2, tokens: 2, cumSum: 3, reqCount: 1, reqCumSum: 2},
+				{timestamp: 3, tokens: 3, cumSum: 6, reqCount: 1, reqCumSum: 3},
+				{timestamp: 4, tokens: 4, cumSum: 10, reqCount: 1, reqCumSum: 4},
+			},
+		},
+	}
+
+	tracker.pruneExpiredBuckets("user1", "model1", 3)
+	bucketData := tracker.userBucketStore["user1"]["model1"]
+
+	if bucketData.start != 0 {
+		t.Fatalf("Expected start to be reset after compaction, got %d", bucketData.start)
+	}
+	if len(bucketData.buckets) != 2 {
+		t.Fatalf("Expected 2 remaining buckets after compaction, got %d", len(bucketData.buckets))
+	}
+	if got := tracker.getActiveTotal(bucketData, 3); got != 7 {
+		t.Fatalf("Expected active token total 7 after compaction, got %v", got)
+	}
+	if got := tracker.getActiveRequestCount(bucketData, 3); got != 2 {
+		t.Fatalf("Expected active request total 2 after compaction, got %d", got)
+	}
+}
 
 func TestNewInMemorySlidingWindowTokenTracker(t *testing.T) {
 	tests := []struct {
@@ -89,6 +120,20 @@ func TestTokenWeightsConfiguration(t *testing.T) {
 			name:             "negative weights (should be ignored)",
 			inputWeight:      -1.0,
 			outputWeight:     -2.0,
+			wantInputWeight:  defaultInputTokenWeight,
+			wantOutputWeight: defaultOutputTokenWeight,
+		},
+		{
+			name:             "nan input weight (should be ignored)",
+			inputWeight:      math.NaN(),
+			outputWeight:     3.0,
+			wantInputWeight:  defaultInputTokenWeight,
+			wantOutputWeight: defaultOutputTokenWeight,
+		},
+		{
+			name:             "infinite output weight (should be ignored)",
+			inputWeight:      1.5,
+			outputWeight:     math.Inf(1),
 			wantInputWeight:  defaultInputTokenWeight,
 			wantOutputWeight: defaultOutputTokenWeight,
 		},
@@ -541,11 +586,13 @@ func TestGetActiveTotal(t *testing.T) {
 	tests := []struct {
 		name       string
 		bucketData *userBucketData
+		cutoff     int64
 		expected   float64
 	}{
 		{
 			name:       "nil bucket data",
 			bucketData: nil,
+			cutoff:     0,
 			expected:   0,
 		},
 		{
@@ -554,6 +601,7 @@ func TestGetActiveTotal(t *testing.T) {
 				buckets: []bucketNode{},
 				start:   0,
 			},
+			cutoff:   0,
 			expected: 0,
 		},
 		{
@@ -562,6 +610,7 @@ func TestGetActiveTotal(t *testing.T) {
 				buckets: []bucketNode{{timestamp: 100, cumSum: 50}},
 				start:   2,
 			},
+			cutoff:   0,
 			expected: 0,
 		},
 		{
@@ -570,6 +619,7 @@ func TestGetActiveTotal(t *testing.T) {
 				buckets: []bucketNode{{timestamp: 100, cumSum: 50}},
 				start:   0,
 			},
+			cutoff:   0,
 			expected: 50,
 		},
 		{
@@ -582,6 +632,7 @@ func TestGetActiveTotal(t *testing.T) {
 				},
 				start: 0,
 			},
+			cutoff:   0,
 			expected: 150,
 		},
 		{
@@ -594,13 +645,27 @@ func TestGetActiveTotal(t *testing.T) {
 				},
 				start: 1,
 			},
+			cutoff:   0,
 			expected: 100, // 150 - 50 = 100
+		},
+		{
+			name: "dynamic cutoff filters old buckets",
+			bucketData: &userBucketData{
+				buckets: []bucketNode{
+					{timestamp: 100, cumSum: 50},
+					{timestamp: 200, cumSum: 100},
+					{timestamp: 300, cumSum: 150},
+				},
+				start: 0,
+			},
+			cutoff:   250, // Only 300 is valid
+			expected: 50,  // 150 - 100 = 50
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := tracker.getActiveTotal(tt.bucketData)
+			result := tracker.getActiveTotal(tt.bucketData, tt.cutoff)
 			if result != tt.expected {
 				t.Errorf("getActiveTotal() = %v, want %v", result, tt.expected)
 			}
@@ -685,4 +750,85 @@ func BenchmarkConcurrentAccess(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestGetRequestCount_Basic(t *testing.T) {
+	tracker := NewInMemorySlidingWindowTokenTracker()
+
+	user := "test-user"
+	model := "test-model"
+
+	// Initially zero
+	count, err := tracker.GetRequestCount(user, model)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0, got %d", count)
+	}
+
+	// After 3 updates, should have 3 requests
+	for i := 0; i < 3; i++ {
+		if err := tracker.UpdateTokenCount(user, model, 10, 5); err != nil {
+			t.Fatalf("UpdateTokenCount failed: %v", err)
+		}
+	}
+
+	count, err = tracker.GetRequestCount(user, model)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("expected 3, got %d", count)
+	}
+}
+
+func TestGetRequestCount_EmptyInputs(t *testing.T) {
+	tracker := NewInMemorySlidingWindowTokenTracker()
+
+	count, err := tracker.GetRequestCount("", "model")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 for empty user, got %d", count)
+	}
+
+	count, err = tracker.GetRequestCount("user", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 for empty model, got %d", count)
+	}
+}
+
+func TestGetRequestCount_Concurrent(t *testing.T) {
+	tracker := NewInMemorySlidingWindowTokenTracker()
+	user := "concurrent-user"
+	model := "concurrent-model"
+	numGoroutines := 10
+	numOps := 100
+
+	var wg sync.WaitGroup
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				_ = tracker.UpdateTokenCount(user, model, 1, 0)
+				_, _ = tracker.GetRequestCount(user, model)
+			}
+		}()
+	}
+	wg.Wait()
+
+	count, err := tracker.GetRequestCount(user, model)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected := numGoroutines * numOps
+	if count != expected {
+		t.Errorf("expected %d, got %d", expected, count)
+	}
 }
